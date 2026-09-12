@@ -1,0 +1,7 @@
+/app/dist/
+/app/wailsjs/
+/app/node_modules/
+/build/bin/
+.agents
+/specs
+/images

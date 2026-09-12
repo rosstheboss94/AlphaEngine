@@ -1,0 +1,28 @@
+{
+  "name": "backtest-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite --host 127.0.0.1 --port 5173 --strictPort",
+    "test": "node --test tests/backtest/model.test.js && vitest run",
+    "preview": "vite preview --host 127.0.0.1",
+    "format:check": "prettier --check src tests vite.config.js vitest.config.js"
+  },
+  "dependencies": {
+    "lucide-react": "^1.43.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@testing-library/react": "^16.3.3",
+    "@vitejs/plugin-react": "^6.1.1",
+    "jsdom": "^29.1.1",
+    "prettier": "^3.9.6",
+    "tailwindcss": "^4.3.3",
+    "vite": "^8.2.2",
+    "vitest": "^5.0.0"
+  }
+}
