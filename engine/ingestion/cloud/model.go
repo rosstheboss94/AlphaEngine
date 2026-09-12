@@ -109,14 +109,20 @@ type QueueRecord struct {
 }
 
 type unitState struct {
-	JobID       string
-	Symbol      string
-	Date        string
-	Status      string
-	Attempts    int
-	Rows        int64
-	InvalidRows int64
-	Error       string
+	JobID              string
+	Symbol             string
+	Date               string
+	Status             string
+	Attempts           int
+	Rows               int64
+	InvalidRows        int64
+	Error              string
+	Cursor             string
+	PageNumber         int
+	PreviousTS         int64
+	LeaseToken         string
+	LeaseExpiresAt     int64
+	ExpectedGeneration string
 }
 
 type schedule struct {

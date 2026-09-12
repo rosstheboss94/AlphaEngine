@@ -16,7 +16,7 @@ Parameters:
     Default: AlphaEngineIngestion
   QueueName:
     Type: String
-    Default: alphaengine-ingestion.fifo
+    Default: alphaengine-ingestion
   ControlCodeKey:
     Type: String
   WorkerCodeKey:
@@ -25,6 +25,8 @@ Parameters:
 Resources:
   IngestionTable:
     Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       TableName: !Ref TableName
       BillingMode: PAY_PER_REQUEST
@@ -65,8 +67,6 @@ Resources:
     Type: AWS::SQS::Queue
     Properties:
       QueueName: !Ref QueueName
-      FifoQueue: true
-      ContentBasedDeduplication: false
       VisibilityTimeout: 360
       MessageRetentionPeriod: 1209600
       RedrivePolicy:
@@ -139,8 +139,8 @@ Resources:
       Handler: bootstrap
       Architectures:
         - arm64
-      MemorySize: 512
-      Timeout: 30
+      MemorySize: 1024
+      Timeout: 900
       Role: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ServiceRoleName}
       Code:
         S3Bucket: !Ref BucketName

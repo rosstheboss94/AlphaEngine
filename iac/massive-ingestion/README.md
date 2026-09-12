@@ -8,7 +8,7 @@ This stack deploys the two Go Lambdas used by the AlphaEngine Data page:
   Massive unit, and writes Snappy Parquet or gzip JSON Lines quarantine objects
   to the existing S3 bucket.
 
-The stack also creates the DynamoDB table, FIFO queue and New York-time 06:00
+The stack also creates the DynamoDB table, SQS unit queue and New York-time 06:00
 EventBridge Scheduler trigger. The existing `AlphaEngineServiceRole` is used by
 both Lambdas. A separate scheduler role is created because EventBridge Scheduler
 and Lambda require different trust policies.

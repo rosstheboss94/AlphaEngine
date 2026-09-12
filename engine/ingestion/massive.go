@@ -24,6 +24,26 @@ type FetchRequest struct {
 	Adjusted  bool
 }
 
+// PageRequest identifies one provider page. Cursor is an opaque absolute
+// provider URL returned by a previous page and Previous is the last accepted
+// timestamp from the prior page in the same unit.
+type PageRequest struct {
+	FetchRequest
+	Cursor     string
+	Previous   time.Time
+	PageNumber int
+}
+
+// PageResult is one complete provider response page. The cursor is safe to
+// persist because provider credentials have been removed.
+type PageResult struct {
+	Bars         []NormalizedBar
+	Issues       []RowIssue
+	NextCursor   string
+	Complete     bool
+	CheckedEmpty bool
+}
+
 type NormalizedBar struct {
 	Provider      string    `json:"provider"`
 	Symbol        string    `json:"symbol"`
@@ -130,6 +150,45 @@ func (c *MassiveClient) FetchUnit(ctx context.Context, request FetchRequest) (Un
 	result.Complete = true
 	result.CheckedEmpty = len(result.Bars) == 0 && len(result.Issues) == 0
 	return result, nil
+}
+
+// FetchPage fetches exactly one Massive response page. It performs no hidden
+// retries, making it suitable for a worker that checkpoints pagination in S3
+// and DynamoDB between Lambda invocations.
+func (c *MassiveClient) FetchPage(ctx context.Context, request PageRequest) (PageResult, error) {
+	request.Symbol = strings.ToUpper(strings.TrimSpace(request.Symbol))
+	if c == nil || strings.TrimSpace(c.APIKey) == "" {
+		return PageResult{}, &ProviderError{Kind: "authentication", Message: "Massive API key is not configured"}
+	}
+	if err := validateFetchRequest(request.FetchRequest); err != nil {
+		return PageResult{}, err
+	}
+	pageNumber := request.PageNumber
+	if pageNumber < 1 {
+		pageNumber = 1
+	}
+	pageURL := strings.TrimSpace(request.Cursor)
+	if pageURL == "" {
+		base := strings.TrimRight(c.BaseURL, "/")
+		if base == "" {
+			base = defaultMassiveBaseURL
+		}
+		path := fmt.Sprintf("%s/v2/aggs/ticker/%s/range/1/minute/%s/%s", base,
+			url.PathEscape(request.Symbol), request.StartDate.Format("2006-01-02"), request.EndDate.Format("2006-01-02"))
+		pageURL = path
+	}
+	pageURL, err := c.withAPIKey(pageURL)
+	if err != nil {
+		return PageResult{}, err
+	}
+	page, next, err := c.fetchPage(ctx, pageURL, request.FetchRequest, pageNumber, request.Previous)
+	if err != nil {
+		return PageResult{}, err
+	}
+	return PageResult{
+		Bars: page.Bars, Issues: page.Issues, NextCursor: safeSourcePage(next),
+		Complete: next == "", CheckedEmpty: next == "" && len(page.Bars) == 0 && len(page.Issues) == 0,
+	}, nil
 }
 
 type pageResult struct {

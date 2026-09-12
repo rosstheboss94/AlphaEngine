@@ -107,3 +107,47 @@ func TestDeletionFenceOnlyAllowsNewerManualBackfill(t *testing.T) {
 		t.Fatal("a stale backfill should not clear the exclusion")
 	}
 }
+
+func TestExecutionObjectKeysAreIsolatedByJob(t *testing.T) {
+	first := publishedObjectKey("job-a", "AAL", "2024-01-02")
+	second := publishedObjectKey("job-b", "AAL", "2024-01-02")
+	if first == second || !strings.Contains(first, "execution=job-a") || !strings.Contains(second, "execution=job-b") {
+		t.Fatalf("execution keys are not isolated: %q, %q", first, second)
+	}
+	if !strings.Contains(stagePageKey("job-a", "AAL", "2024-01-02", 3), "page=000003") {
+		t.Fatal("staged page key should include a zero-padded page number")
+	}
+}
+
+func TestUnitItemRoundTripsDurablePageAndLeaseState(t *testing.T) {
+	want := unitState{
+		JobID: "job-a", Symbol: "AAL", Date: "2024-01-02", Status: "waiting", Attempts: 2,
+		Rows: 10, InvalidRows: 1, Cursor: "https://api.massive.com/next", PageNumber: 3,
+		PreviousTS: 1704202200000000000, LeaseToken: "lease-a", LeaseExpiresAt: 1704202400000,
+		ExpectedGeneration: "generation-a",
+	}
+	got := unitFromItem(unitItem(want))
+	if got != want {
+		t.Fatalf("unit state round trip = %+v, want %+v", got, want)
+	}
+}
+
+func TestRetryDelayUsesBoundedExponentialBackoff(t *testing.T) {
+	if retryDelay(1) != 15*time.Second || retryDelay(2) != 30*time.Second || retryDelay(5) != 4*time.Minute || retryDelay(7) != 15*time.Minute {
+		t.Fatalf("unexpected retry delays: %s, %s, %s, %s", retryDelay(1), retryDelay(2), retryDelay(5), retryDelay(7))
+	}
+}
+
+func TestRandomIDsDoNotReuseExecutionIdentity(t *testing.T) {
+	first, err := randomID("request")
+	if err != nil {
+		t.Fatalf("randomID() error = %v", err)
+	}
+	second, err := randomID("request")
+	if err != nil {
+		t.Fatalf("randomID() error = %v", err)
+	}
+	if first == second || !strings.HasPrefix(first, "request-") || !strings.HasPrefix(second, "request-") {
+		t.Fatalf("unexpected random IDs: %q, %q", first, second)
+	}
+}

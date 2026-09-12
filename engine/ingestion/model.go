@@ -35,10 +35,11 @@ type Preview struct {
 }
 
 type BackfillRequest struct {
-	ListID  string   `json:"list_id"`
-	Symbols []string `json:"symbols,omitempty"`
-	Start   string   `json:"start"`
-	End     string   `json:"end"`
+	ListID          string   `json:"list_id"`
+	Symbols         []string `json:"symbols,omitempty"`
+	Start           string   `json:"start"`
+	End             string   `json:"end"`
+	IdempotencyKey  string   `json:"idempotency_key,omitempty"`
 }
 
 type Job struct {

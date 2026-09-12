@@ -2,6 +2,7 @@
 /app/wailsjs/
 /app/node_modules/
 /build/bin/
+/build/ingestion-*-test
 .env
 !.env.example
 .agents

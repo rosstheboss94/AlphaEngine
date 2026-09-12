@@ -82,6 +82,30 @@ func TestMassiveFetchUnitRejectsFractionalVolumeAndWrongDate(t *testing.T) {
 	}
 }
 
+func TestMassiveFetchPagePersistsOnlyCredentialFreeCursor(t *testing.T) {
+	nextURL := ""
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("apiKey") != "secret" {
+			t.Fatal("page request did not include the API key")
+		}
+		_, _ = w.Write([]byte(`{"results":[{"t":1704115800000,"o":10,"h":11,"l":9,"c":10.5,"v":100}],"next_url":"` + nextURL + `"}`))
+	}))
+	defer server.Close()
+	nextURL = server.URL + "/next?apiKey=should-not-persist"
+	client := ingestion.NewMassiveClient("secret", server.Client())
+	client.BaseURL = server.URL
+	start := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	result, err := client.FetchPage(context.Background(), ingestion.PageRequest{
+		FetchRequest: ingestion.FetchRequest{Symbol: "AAL", StartDate: start, EndDate: start}, PageNumber: 1,
+	})
+	if err != nil {
+		t.Fatalf("FetchPage() error = %v", err)
+	}
+	if len(result.Bars) != 1 || result.NextCursor == "" || strings.Contains(result.NextCursor, "apiKey") {
+		t.Fatalf("unexpected page result: %+v", result)
+	}
+}
+
 func TestServicePreviewValidatesAndReportsSetup(t *testing.T) {
 	service := ingestion.NewConfiguredService(ingestion.Config{Region: "us-east-1"}, nil)
 	status := service.Status()
