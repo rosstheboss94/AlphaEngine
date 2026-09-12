@@ -695,14 +695,20 @@ func (h *Handler) deleteDataUnit(ctx context.Context, symbol, date string) error
 	if err != nil {
 		return err
 	}
-	deletionID := stringAttribute(item, "deletion_id")
+	deletionID := ""
+	if stringAttribute(item, "status") == "deleted" {
+		deletionID = stringAttribute(item, "deletion_id")
+	}
 	if deletionID == "" {
 		deletionID, err = randomID("deletion")
 		if err != nil {
 			return err
 		}
 	}
-	deletedAt := stringAttribute(item, "deleted_at")
+	deletedAt := ""
+	if stringAttribute(item, "status") == "deleted" {
+		deletedAt = stringAttribute(item, "deleted_at")
+	}
 	if deletedAt == "" {
 		deletedAt = h.now().UTC().Format(time.RFC3339Nano)
 	}
@@ -712,6 +718,7 @@ func (h *Handler) deleteDataUnit(ctx context.Context, symbol, date string) error
 	for _, name := range []string{"object_key", "candidate_key", "quarantine_key"} {
 		if objectKey := stringAttribute(item, name); objectKey != "" {
 			if _, err := h.s3.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(h.cfg.Bucket), Key: aws.String(objectKey)}); err != nil {
+				_ = h.markDeletionCleanup(ctx, symbol, date, deletionID, "failed", err.Error())
 				return fmt.Errorf("delete S3 object %q: %w", objectKey, err)
 			}
 		}
@@ -761,7 +768,7 @@ func (h *Handler) writeDeletionTombstone(ctx context.Context, symbol, date, dele
 		"pk": stringValue(dataKey(symbol, date)), "sk": stringValue(currentSortKey),
 		"entity": stringValue("data_exclusion"), "status": stringValue("deleted"),
 		"symbol": stringValue(symbol), "date": stringValue(date), "deletion_id": stringValue(deletionID),
-		"deleted_at": stringValue(deletedAt), "cleanup_status": stringValue("pending"), "cleanup_error": stringValue(""),
+		"deleted_at": stringValue(deletedAt), "cleared_job_id": stringValue(""), "cleanup_status": stringValue("pending"), "cleanup_error": stringValue(""),
 		"updated_at": stringValue(h.now().UTC().Format(time.RFC3339Nano)),
 	}
 	if _, err := h.ddb.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String(h.cfg.TableName), Item: tombstone}); err != nil {
@@ -846,7 +853,7 @@ func (h *Handler) handleUnit(ctx context.Context, message UnitMessage) error {
 	}
 	if unit.NotBefore > h.now().UTC().UnixMilli() {
 		delay := time.Duration(unit.NotBefore-h.now().UTC().UnixMilli()) * time.Millisecond
-		return h.enqueueWithDelay(ctx, []UnitMessage{message}, delay)
+		return h.enqueueForUnit(ctx, unit, message, delay)
 	}
 	claimed := false
 	unit, claimed, err = h.claimUnit(ctx, unit)
@@ -865,7 +872,7 @@ func (h *Handler) handleUnit(ctx context.Context, message UnitMessage) error {
 	}
 	if stringAttribute(dataItem, "status") == "deleted" {
 		if job.Source == "manual" && deletionPredatesJob(dataItem, job.CreatedAt) {
-			cleared, err := h.clearExclusion(ctx, message.Symbol, message.Date, stringAttribute(dataItem, "deletion_id"))
+			cleared, err := h.clearExclusion(ctx, message.Symbol, message.Date, stringAttribute(dataItem, "deletion_id"), message.JobID)
 			if err != nil {
 				return h.retryUnit(ctx, unit, err)
 			}
@@ -990,7 +997,7 @@ func (h *Handler) handleUnit(ctx context.Context, message UnitMessage) error {
 			if dataErr != nil {
 				return h.retryUnit(ctx, unit, dataErr)
 			}
-			if stringAttribute(latestData, "status") == "deleted" || (unit.ExpectedGeneration == generationAbsent && stringAttribute(latestData, "status") == "current") || (unit.ExpectedGeneration != generationAbsent && stringAttribute(latestData, "generation") != "" && stringAttribute(latestData, "generation") != unit.ExpectedGeneration) {
+			if stringAttribute(latestData, "status") == "deleted" || (unit.ExpectedGeneration == generationAbsent && stringAttribute(latestData, "status") == "current") || (unit.ExpectedGeneration == generationAbsent && stringAttribute(latestData, "status") == "cleared" && stringAttribute(latestData, "cleared_job_id") != unit.JobID) || (unit.ExpectedGeneration != generationAbsent && stringAttribute(latestData, "generation") != "" && stringAttribute(latestData, "generation") != unit.ExpectedGeneration) {
 				return h.finishUnit(ctx, unit, "needs-attention", int64(len(allBars)), 0, "current data changed before publication; explicit review is required", "", "", "")
 			}
 		}
@@ -1125,7 +1132,12 @@ func (h *Handler) retryUnit(ctx context.Context, unit unitState, cause error) er
 	if unit.Attempts >= maxAttempts {
 		return h.finishUnit(ctx, unit, "failed", unit.Rows, unit.InvalidRows, cause.Error(), "", "", "")
 	}
-	return h.retryWithDelay(ctx, UnitMessage{JobID: unit.JobID, Symbol: unit.Symbol, Date: unit.Date}, unit, cause, 0)
+	retryAfter := time.Duration(0)
+	var providerErr *ingestion.ProviderError
+	if errors.As(cause, &providerErr) {
+		retryAfter = providerErr.RetryAfter
+	}
+	return h.retryWithDelay(ctx, UnitMessage{JobID: unit.JobID, Symbol: unit.Symbol, Date: unit.Date}, unit, cause, retryAfter)
 }
 
 func (h *Handler) retryWithDelay(ctx context.Context, message UnitMessage, unit unitState, cause error, retryAfter time.Duration) error {
@@ -1287,6 +1299,9 @@ func (h *Handler) waitForProviderSlot(ctx context.Context) error {
 		delay := time.Duration(next-nowMillis) * time.Millisecond
 		if delay < 0 {
 			delay = providerRequestInterval
+		}
+		if delay > 30*time.Second {
+			return &ingestion.ProviderError{Kind: "throttle", RetryAfter: delay, Message: "Massive provider cooldown active"}
 		}
 		if err := wait(ctx, delay); err != nil {
 			return err
@@ -1486,13 +1501,17 @@ func (h *Handler) queryIndex(ctx context.Context, partition, sortPrefix string) 
 }
 
 func (h *Handler) queryIndexName(ctx context.Context, indexName, partition, sortPrefix string) ([]map[string]dynamodbtypes.AttributeValue, error) {
+	partitionAttribute, sortAttribute := "gsi1pk", "gsi1sk"
+	if indexName == "IngestionDataIndex" {
+		partitionAttribute, sortAttribute = "gsi2pk", "gsi2sk"
+	}
 	output, err := h.ddb.Query(ctx, &dynamodb.QueryInput{
 		TableName:              aws.String(h.cfg.TableName),
 		IndexName:              aws.String(indexName),
 		KeyConditionExpression: aws.String("#pk = :pk AND begins_with(#sk, :prefix)"),
 		ExpressionAttributeNames: map[string]string{
-			"#pk": "gsi1pk",
-			"#sk": "gsi1sk",
+			"#pk": partitionAttribute,
+			"#sk": sortAttribute,
 		},
 		ExpressionAttributeValues: map[string]dynamodbtypes.AttributeValue{
 			":pk": stringValue(partition), ":prefix": stringValue(sortPrefix),
@@ -1533,10 +1552,9 @@ func (h *Handler) publish(ctx context.Context, unit unitState, symbol, date, obj
 		":date": stringValue(date), ":object_key": stringValue(objectKey), ":new_generation": item["generation"],
 		":updated": stringValue(now.Format(time.RFC3339)),
 	}
-	dataCondition := "attribute_not_exists(#status)"
-	if unit.ExpectedGeneration != "" && unit.ExpectedGeneration != generationAbsent {
-		dataCondition = "#status = :current AND generation = :expected_generation"
-		dataValues[":expected_generation"] = stringValue(unit.ExpectedGeneration)
+	dataCondition, fenceValues := dataFence(unit)
+	for name, value := range fenceValues {
+		dataValues[name] = value
 	}
 	_, err := h.ddb.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []dynamodbtypes.TransactWriteItem{
 		{ConditionCheck: &dynamodbtypes.ConditionCheck{
@@ -1577,14 +1595,24 @@ func (h *Handler) artifactFence(ctx context.Context, unit unitState) error {
 	return nil
 }
 
+func dataFence(unit unitState) (string, map[string]dynamodbtypes.AttributeValue) {
+	values := map[string]dynamodbtypes.AttributeValue{":current": stringValue("current")}
+	switch {
+	case unit.ExpectedGeneration == generationAbsent:
+		return "attribute_not_exists(#status) OR (#status = :cleared AND cleared_job_id = :job_id)", map[string]dynamodbtypes.AttributeValue{
+			":cleared": stringValue("cleared"), ":job_id": stringValue(unit.JobID),
+		}
+	case unit.ExpectedGeneration != "":
+		values[":expected_generation"] = stringValue(unit.ExpectedGeneration)
+		return "#status = :current AND generation = :expected_generation", values
+	default:
+		return "attribute_not_exists(#status)", values
+	}
+}
+
 func (h *Handler) artifactFenceItems(unit unitState) []dynamodbtypes.TransactWriteItem {
 	now := h.now().UTC()
-	dataCondition := "attribute_not_exists(#status)"
-	dataValues := map[string]dynamodbtypes.AttributeValue{":current": stringValue("current")}
-	if unit.ExpectedGeneration != "" && unit.ExpectedGeneration != generationAbsent {
-		dataCondition = "#status = :current AND generation = :expected_generation"
-		dataValues[":expected_generation"] = stringValue(unit.ExpectedGeneration)
-	}
+	dataCondition, dataValues := dataFence(unit)
 	return []dynamodbtypes.TransactWriteItem{
 		{ConditionCheck: &dynamodbtypes.ConditionCheck{
 			TableName: aws.String(h.cfg.TableName), Key: key(jobPartition, jobSortPrefix+unit.JobID),
@@ -1833,12 +1861,16 @@ func (h *Handler) isDeleted(ctx context.Context, symbol, date string) (bool, err
 	return stringAttribute(item, "status") == "deleted", nil
 }
 
-func (h *Handler) clearExclusion(ctx context.Context, symbol, date, deletionID string) (bool, error) {
-	_, err := h.ddb.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+func (h *Handler) clearExclusion(ctx context.Context, symbol, date, deletionID, jobID string) (bool, error) {
+	_, err := h.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: aws.String(h.cfg.TableName), Key: key(dataKey(symbol, date), currentSortKey),
-		ConditionExpression:       aws.String("#status = :deleted AND deletion_id = :deletion_id"),
-		ExpressionAttributeNames:  map[string]string{"#status": "status"},
-		ExpressionAttributeValues: map[string]dynamodbtypes.AttributeValue{":deleted": stringValue("deleted"), ":deletion_id": stringValue(deletionID)},
+		UpdateExpression:         aws.String("SET #status = :cleared, cleared_job_id = :job_id, cleared_at = :cleared_at, updated_at = :cleared_at"),
+		ConditionExpression:      aws.String("#status = :deleted AND deletion_id = :deletion_id"),
+		ExpressionAttributeNames: map[string]string{"#status": "status"},
+		ExpressionAttributeValues: map[string]dynamodbtypes.AttributeValue{
+			":cleared": stringValue("cleared"), ":job_id": stringValue(jobID), ":cleared_at": stringValue(h.now().UTC().Format(time.RFC3339Nano)),
+			":deleted": stringValue("deleted"), ":deletion_id": stringValue(deletionID),
+		},
 	})
 	if err != nil {
 		if isConditionalFailure(err) {

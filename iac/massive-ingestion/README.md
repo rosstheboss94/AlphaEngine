@@ -26,8 +26,10 @@ file and run:
 
 The script reads `MASSIVE_API_KEY` only to create or rotate the named Secrets
 Manager secret. It does not put the key in Lambda environment variables or the
-CloudFormation template. It uploads versioned Lambda zip files under the
-`_deploy/ingestion/` prefix in the supplied bucket.
+CloudFormation template. It preserves existing S3 lifecycle rules and merges
+30-day expiry rules for Massive staging, candidate and quarantine prefixes. It
+uploads versioned Lambda zip files under the `_deploy/ingestion/` prefix in the
+supplied bucket.
 
 After deployment, set the control Lambda ARN from the stack outputs before
 starting the desktop app:

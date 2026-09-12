@@ -37,6 +37,7 @@ Invoke-Aws @("s3api", "head-bucket", "--bucket", $BucketName, "--region", $Regio
 Invoke-Aws @("iam", "get-role", "--role-name", $ServiceRoleName)
 
 $secretFile = Join-Path ([IO.Path]::GetTempPath()) ("alphaengine-massive-" + [guid]::NewGuid().ToString("N") + ".json")
+$lifecycleFile = Join-Path ([IO.Path]::GetTempPath()) ("alphaengine-ingestion-lifecycle-" + [guid]::NewGuid().ToString("N") + ".json")
 $artifactDir = Join-Path $repoRoot "build\ingestion-lambda"
 $stamp = Get-Date -Format "yyyyMMddHHmmss"
 $controlZip = Join-Path $artifactDir "control.zip"
@@ -46,6 +47,26 @@ $workerKey = "_deploy/ingestion/$stamp/worker.zip"
 
 try {
     [IO.File]::WriteAllText($secretFile, (@{ MASSIVE_API_KEY = $massiveKey } | ConvertTo-Json -Compress))
+
+    & aws s3api get-bucket-lifecycle-configuration --bucket $BucketName --region $Region *> $null
+    $existingRules = @()
+    if ($LASTEXITCODE -eq 0) {
+        $existingJson = & aws s3api get-bucket-lifecycle-configuration --bucket $BucketName --region $Region --output json
+        if ($LASTEXITCODE -ne 0) {
+            throw "Could not read the existing S3 lifecycle configuration."
+        }
+        $existing = $existingJson | ConvertFrom-Json
+        if ($null -ne $existing.Rules) {
+            $existingRules = @($existing.Rules)
+        }
+    }
+    $managedRuleIDs = @("AlphaEngineMassiveStaging30Days", "AlphaEngineMassiveCandidates30Days", "AlphaEngineMassiveQuarantine30Days")
+    $rules = @($existingRules | Where-Object { $managedRuleIDs -notcontains $_.ID })
+    $rules += [pscustomobject]@{ ID = $managedRuleIDs[0]; Status = "Enabled"; Filter = @{ Prefix = "staging/provider=massive/" }; Expiration = @{ Days = 30 } }
+    $rules += [pscustomobject]@{ ID = $managedRuleIDs[1]; Status = "Enabled"; Filter = @{ Prefix = "candidates/provider=massive/" }; Expiration = @{ Days = 30 } }
+    $rules += [pscustomobject]@{ ID = $managedRuleIDs[2]; Status = "Enabled"; Filter = @{ Prefix = "quarantine/provider=massive/" }; Expiration = @{ Days = 30 } }
+    [IO.File]::WriteAllText($lifecycleFile, (@{ Rules = $rules } | ConvertTo-Json -Depth 6))
+    Invoke-Aws @("s3api", "put-bucket-lifecycle-configuration", "--bucket", $BucketName, "--lifecycle-configuration", "file://$lifecycleFile", "--region", $Region)
 
     & aws secretsmanager describe-secret --secret-id $SecretName --region $Region *> $null
     $secretExists = $LASTEXITCODE -eq 0
@@ -92,5 +113,8 @@ try {
 } finally {
     if (Test-Path -LiteralPath $secretFile) {
         Remove-Item -LiteralPath $secretFile -Force
+    }
+    if (Test-Path -LiteralPath $lifecycleFile) {
+        Remove-Item -LiteralPath $lifecycleFile -Force
     }
 }
