@@ -22,6 +22,25 @@ wails build
 .\build\bin\backtest-desktop.exe
 ```
 
+## Run the app with Docker
+
+Docker serves the browser version of the React app. It does not launch the
+native Wails window, which requires a desktop environment. From the project
+root, run:
+
+```powershell
+docker compose up --build
+```
+
+Open `http://localhost:5173`. Stop the container with:
+
+```powershell
+docker compose down
+```
+
+The Docker image contains the built frontend only. Browser-only behavior, such
+as CSV download, remains available; Wails native integrations are not present.
+
 For browser-only development:
 
 ```powershell
