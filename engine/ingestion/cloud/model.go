@@ -120,6 +120,7 @@ type unitState struct {
 	Cursor             string
 	PageNumber         int
 	PreviousTS         int64
+	StageKeys          []string
 	LeaseToken         string
 	LeaseExpiresAt     int64
 	ExpectedGeneration string

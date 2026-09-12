@@ -3,6 +3,7 @@ package cloudingestion
 import (
 	"bytes"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -109,12 +110,12 @@ func TestDeletionFenceOnlyAllowsNewerManualBackfill(t *testing.T) {
 }
 
 func TestExecutionObjectKeysAreIsolatedByJob(t *testing.T) {
-	first := publishedObjectKey("job-a", "AAL", "2024-01-02")
-	second := publishedObjectKey("job-b", "AAL", "2024-01-02")
-	if first == second || !strings.Contains(first, "execution=job-a") || !strings.Contains(second, "execution=job-b") {
+	first := publishedObjectKey("job-a", "AAL", "2024-01-02", "lease-a")
+	second := publishedObjectKey("job-b", "AAL", "2024-01-02", "lease-b")
+	if first == second || !strings.Contains(first, "execution=job-a") || !strings.Contains(first, "lease=lease-a") || !strings.Contains(second, "execution=job-b") || first == publishedObjectKey("job-a", "AAL", "2024-01-02", "lease-b") {
 		t.Fatalf("execution keys are not isolated: %q, %q", first, second)
 	}
-	if !strings.Contains(stagePageKey("job-a", "AAL", "2024-01-02", 3), "page=000003") {
+	if !strings.Contains(stagePageKey("job-a", "AAL", "2024-01-02", 3, "lease-a"), "page=000003") {
 		t.Fatal("staged page key should include a zero-padded page number")
 	}
 }
@@ -123,11 +124,12 @@ func TestUnitItemRoundTripsDurablePageAndLeaseState(t *testing.T) {
 	want := unitState{
 		JobID: "job-a", Symbol: "AAL", Date: "2024-01-02", Status: "waiting", Attempts: 2,
 		Rows: 10, InvalidRows: 1, Cursor: "https://api.massive.com/next", PageNumber: 3,
+		StageKeys:  []string{"staging/page-1.json.gz", "staging/page-2.json.gz"},
 		PreviousTS: 1704202200000000000, LeaseToken: "lease-a", LeaseExpiresAt: 1704202400000,
 		ExpectedGeneration: "generation-a",
 	}
 	got := unitFromItem(unitItem(want))
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("unit state round trip = %+v, want %+v", got, want)
 	}
 }

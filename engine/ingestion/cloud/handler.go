@@ -45,6 +45,7 @@ const (
 	listSortPrefix          = "LIST#"
 	jobSortPrefix           = "JOB#"
 	scheduleSortPrefix      = "SCHEDULE#"
+	generationAbsent        = "__no_current_generation__"
 	providerRequestInterval = 15 * time.Second
 	leaseDuration           = 3 * time.Minute
 )
@@ -787,12 +788,22 @@ func (h *Handler) handleUnit(ctx context.Context, message UnitMessage) error {
 			return h.finishUnit(ctx, unit, "cancelled", unit.Rows, unit.InvalidRows, "unit is excluded by an explicit deletion", "", "", "")
 		}
 	}
-	currentGeneration := stringAttribute(dataItem, "generation")
-	if unit.ExpectedGeneration != "" && currentGeneration != unit.ExpectedGeneration {
+	currentGeneration := ""
+	if stringAttribute(dataItem, "status") == "current" {
+		currentGeneration = stringAttribute(dataItem, "generation")
+	}
+	if unit.ExpectedGeneration == generationAbsent && currentGeneration != "" {
+		return h.finishUnit(ctx, unit, "needs-attention", unit.Rows, unit.InvalidRows, "current data appeared while this unit was in progress", "", "", "")
+	}
+	if unit.ExpectedGeneration != "" && unit.ExpectedGeneration != generationAbsent && currentGeneration != unit.ExpectedGeneration {
 		return h.finishUnit(ctx, unit, "needs-attention", unit.Rows, unit.InvalidRows, "current data changed while this unit was in progress", "", "", "")
 	}
 	if unit.ExpectedGeneration == "" {
-		unit.ExpectedGeneration = currentGeneration
+		if currentGeneration == "" {
+			unit.ExpectedGeneration = generationAbsent
+		} else {
+			unit.ExpectedGeneration = currentGeneration
+		}
 	}
 	key, err := h.massiveAPIKey(ctx)
 	if err != nil {
@@ -817,25 +828,27 @@ func (h *Handler) handleUnit(ctx context.Context, message UnitMessage) error {
 	if err != nil {
 		return h.finishProviderError(ctx, message, unit, err)
 	}
-	if err := h.putStagedPage(ctx, stagePageKey(message.JobID, message.Symbol, message.Date, pageNumber), stagedPage{Bars: result.Bars, Issues: result.Issues}); err != nil {
+	stageKey := stagePageKey(message.JobID, message.Symbol, message.Date, pageNumber, unit.LeaseToken)
+	if err := h.putStagedPage(ctx, stageKey, stagedPage{Bars: result.Bars, Issues: result.Issues}); err != nil {
 		return h.retryUnit(ctx, unit, err)
 	}
 	if result.NextCursor != "" && result.NextCursor == unit.Cursor {
 		return h.finishProviderError(ctx, message, unit, &ingestion.ProviderError{Kind: "schema", Message: "pagination cursor repeated"})
 	}
 	if result.NextCursor != "" {
-		if err := h.checkpointPage(ctx, unit, result.NextCursor, pageNumber, result.Bars, result.Issues); err != nil {
+		if err := h.checkpointPage(ctx, unit, stageKey, result.NextCursor, pageNumber, result.Bars, result.Issues); err != nil {
 			return err
 		}
 		return h.enqueue(ctx, []UnitMessage{message})
 	}
-	allBars, allIssues, err := h.readStagedPages(ctx, message.JobID, message.Symbol, message.Date, pageNumber)
+	stageKeys := append(append([]string(nil), unit.StageKeys...), stageKey)
+	allBars, allIssues, err := h.readStagedPages(ctx, stageKeys)
 	if err != nil {
 		return h.retryUnit(ctx, unit, err)
 	}
 	quarantineKey := ""
 	if len(allIssues) > 0 {
-		quarantineKey = quarantineObjectKey(message.JobID, message.Symbol, message.Date)
+		quarantineKey = quarantineObjectKey(message.JobID, message.Symbol, message.Date, unit.LeaseToken)
 		if err := h.putQuarantine(ctx, quarantineKey, allIssues); err != nil {
 			return h.retryUnit(ctx, unit, err)
 		}
@@ -852,7 +865,7 @@ func (h *Handler) handleUnit(ctx context.Context, message UnitMessage) error {
 			return h.retryUnit(ctx, unit, err)
 		}
 		if len(omitted) > 0 {
-			candidateKey := candidateObjectKey(message.JobID, message.Symbol, message.Date)
+			candidateKey := candidateObjectKey(message.JobID, message.Symbol, message.Date, unit.LeaseToken)
 			if err := h.putParquet(ctx, candidateKey, allBars); err != nil {
 				return h.retryUnit(ctx, unit, err)
 			}
@@ -868,13 +881,13 @@ func (h *Handler) handleUnit(ctx context.Context, message UnitMessage) error {
 		}
 	}
 	if len(allIssues) > 0 {
-		candidateKey := candidateObjectKey(message.JobID, message.Symbol, message.Date)
+		candidateKey := candidateObjectKey(message.JobID, message.Symbol, message.Date, unit.LeaseToken)
 		if err := h.putParquet(ctx, candidateKey, allBars); err != nil {
 			return h.retryUnit(ctx, unit, err)
 		}
 		return h.finishUnit(ctx, unit, "incomplete", int64(len(allBars)), int64(len(allIssues)), "invalid rows were quarantined; candidate was not published", "", candidateKey, quarantineKey)
 	}
-	objectKey := publishedObjectKey(message.JobID, message.Symbol, message.Date)
+	objectKey := publishedObjectKey(message.JobID, message.Symbol, message.Date, unit.LeaseToken)
 	if err := h.publish(ctx, unit, message.Symbol, message.Date, objectKey, allBars); err != nil {
 		if errors.Is(err, errPublicationFence) {
 			latestJob, jobFound, jobErr := h.getJob(ctx, message.JobID)
@@ -888,7 +901,7 @@ func (h *Handler) handleUnit(ctx context.Context, message UnitMessage) error {
 			if dataErr != nil {
 				return h.retryUnit(ctx, unit, dataErr)
 			}
-			if stringAttribute(latestData, "status") == "deleted" || (stringAttribute(latestData, "generation") != "" && stringAttribute(latestData, "generation") != unit.ExpectedGeneration) {
+			if stringAttribute(latestData, "status") == "deleted" || (unit.ExpectedGeneration == generationAbsent && stringAttribute(latestData, "status") == "current") || (unit.ExpectedGeneration != generationAbsent && stringAttribute(latestData, "generation") != "" && stringAttribute(latestData, "generation") != unit.ExpectedGeneration) {
 				return h.finishUnit(ctx, unit, "needs-attention", int64(len(allBars)), 0, "current data changed before publication; explicit review is required", "", "", "")
 			}
 		}
@@ -921,14 +934,14 @@ func (h *Handler) putStagedPage(ctx context.Context, objectKey string, page stag
 	return nil
 }
 
-func (h *Handler) readStagedPages(ctx context.Context, jobID, symbol, date string, pages int) ([]ingestion.NormalizedBar, []ingestion.RowIssue, error) {
-	if pages < 1 {
+func (h *Handler) readStagedPages(ctx context.Context, stageKeys []string) ([]ingestion.NormalizedBar, []ingestion.RowIssue, error) {
+	if len(stageKeys) < 1 {
 		return nil, nil, errors.New("staged page count must be positive")
 	}
 	bars := make([]ingestion.NormalizedBar, 0)
 	issues := make([]ingestion.RowIssue, 0)
-	for pageNumber := 1; pageNumber <= pages; pageNumber++ {
-		object, err := h.s3.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(h.cfg.Bucket), Key: aws.String(stagePageKey(jobID, symbol, date, pageNumber))})
+	for pageNumber, stageKey := range stageKeys {
+		object, err := h.s3.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(h.cfg.Bucket), Key: aws.String(stageKey)})
 		if err != nil {
 			return nil, nil, fmt.Errorf("read staged page %d: %w", pageNumber, err)
 		}
@@ -960,24 +973,27 @@ func firstError(first, second error) error {
 	return second
 }
 
-func (h *Handler) checkpointPage(ctx context.Context, unit unitState, cursor string, pageNumber int, bars []ingestion.NormalizedBar, issues []ingestion.RowIssue) error {
+func (h *Handler) checkpointPage(ctx context.Context, unit unitState, stageKey, cursor string, pageNumber int, bars []ingestion.NormalizedBar, issues []ingestion.RowIssue) error {
 	rows := unit.Rows + int64(len(bars))
 	invalidRows := unit.InvalidRows + int64(len(issues))
 	previousTS := unit.PreviousTS
 	if len(bars) > 0 {
 		previousTS = bars[len(bars)-1].IntervalStart.UnixNano()
 	}
+	stageKeys := append(append([]string(nil), unit.StageKeys...), stageKey)
 	now := h.now().UTC()
 	_, err := h.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                aws.String(h.cfg.TableName),
 		Key:                      key(unitPartitionBase+unit.JobID, unitKey(unit.Symbol, unit.Date)),
-		UpdateExpression:         aws.String("SET #status = :waiting, cursor = :cursor, page_number = :page, previous_ts = :previous, rows = :rows, invalid_rows = :invalid, attempts = :zero, lease_token = :empty, lease_expires_at = :zero, updated_at = :updated"),
+		UpdateExpression:         aws.String("SET #status = :waiting, cursor = :cursor, page_number = :page, previous_ts = :previous, rows = :rows, invalid_rows = :invalid, staged_pages = :staged_pages, expected_generation = :expected_generation, attempts = :zero, lease_token = :empty, lease_expires_at = :zero, updated_at = :updated"),
 		ConditionExpression:      aws.String("#status = :running AND lease_token = :lease"),
 		ExpressionAttributeNames: map[string]string{"#status": "status"},
 		ExpressionAttributeValues: map[string]dynamodbtypes.AttributeValue{
 			":waiting": stringValue("waiting"), ":cursor": stringValue(cursor), ":page": numberValue(pageNumber),
 			":previous": numberValue(previousTS), ":rows": numberValue(rows), ":invalid": numberValue(invalidRows),
-			":zero": numberValue(0), ":empty": stringValue(""), ":updated": stringValue(now.Format(time.RFC3339)),
+			":staged_pages":        jsonValue(stageKeys),
+			":expected_generation": stringValue(unit.ExpectedGeneration),
+			":zero":                numberValue(0), ":empty": stringValue(""), ":updated": stringValue(now.Format(time.RFC3339)),
 			":lease": stringValue(unit.LeaseToken),
 		},
 	})
@@ -1344,7 +1360,7 @@ func (h *Handler) publish(ctx context.Context, unit unitState, symbol, date, obj
 		":updated": stringValue(now.Format(time.RFC3339)),
 	}
 	dataCondition := "attribute_not_exists(#status)"
-	if unit.ExpectedGeneration != "" {
+	if unit.ExpectedGeneration != "" && unit.ExpectedGeneration != generationAbsent {
 		dataCondition = "#status = :current AND generation = :expected_generation"
 		dataValues[":expected_generation"] = stringValue(unit.ExpectedGeneration)
 	}
@@ -1368,7 +1384,7 @@ func (h *Handler) publish(ctx context.Context, unit unitState, symbol, date, obj
 	}})
 	if err != nil {
 		_, _ = h.s3.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(h.cfg.Bucket), Key: aws.String(objectKey)})
-		if isConditionalFailure(err) || strings.Contains(err.Error(), "TransactionCanceledException") {
+		if isConditionalFailure(err) || isTransactionCanceled(err) {
 			return errPublicationFence
 		}
 		return fmt.Errorf("publish current data reference: %w", err)
@@ -1506,7 +1522,7 @@ func (h *Handler) adjustJob(ctx context.Context, previous unitState, nextStatus 
 func (h *Handler) resetUnit(ctx context.Context, unit unitState) error {
 	if _, err := h.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: aws.String(h.cfg.TableName), Key: key(unitPartitionBase+unit.JobID, unitKey(unit.Symbol, unit.Date)),
-		UpdateExpression:         aws.String("SET #status = :waiting, attempts = :zero, rows = :zero, invalid_rows = :zero, #error = :empty, object_key = :empty, candidate_key = :empty, quarantine_key = :empty, cursor = :empty, page_number = :zero, previous_ts = :zero, expected_generation = :empty, lease_token = :empty, lease_expires_at = :zero, updated_at = :updated"),
+		UpdateExpression:         aws.String("SET #status = :waiting, attempts = :zero, rows = :zero, invalid_rows = :zero, #error = :empty, object_key = :empty, candidate_key = :empty, quarantine_key = :empty, cursor = :empty, staged_pages = :empty, page_number = :zero, previous_ts = :zero, expected_generation = :empty, lease_token = :empty, lease_expires_at = :zero, updated_at = :updated"),
 		ConditionExpression:      aws.String("#status IN (:failed, :incomplete, :attention)"),
 		ExpressionAttributeNames: map[string]string{"#status": "status", "#error": "error"},
 		ExpressionAttributeValues: map[string]dynamodbtypes.AttributeValue{
@@ -1764,20 +1780,20 @@ func dataKey(symbol, date string) string { return dataPartitionBase + symbol + "
 
 func unitKey(symbol, date string) string { return unitSortPrefix + date + "#" + symbol }
 
-func publishedObjectKey(jobID, symbol, date string) string {
-	return fmt.Sprintf("data/provider=massive/symbol=%s/date=%s/execution=%s.parquet", symbol, date, jobID)
+func publishedObjectKey(jobID, symbol, date, leaseToken string) string {
+	return fmt.Sprintf("data/provider=massive/symbol=%s/date=%s/execution=%s/lease=%s.parquet", symbol, date, jobID, leaseToken)
 }
 
-func candidateObjectKey(jobID, symbol, date string) string {
-	return fmt.Sprintf("candidates/provider=massive/symbol=%s/date=%s/execution=%s.parquet", symbol, date, jobID)
+func candidateObjectKey(jobID, symbol, date, leaseToken string) string {
+	return fmt.Sprintf("candidates/provider=massive/symbol=%s/date=%s/execution=%s/lease=%s.parquet", symbol, date, jobID, leaseToken)
 }
 
-func quarantineObjectKey(jobID, symbol, date string) string {
-	return fmt.Sprintf("quarantine/provider=massive/symbol=%s/date=%s/execution=%s.jsonl.gz", symbol, date, jobID)
+func quarantineObjectKey(jobID, symbol, date, leaseToken string) string {
+	return fmt.Sprintf("quarantine/provider=massive/symbol=%s/date=%s/execution=%s/lease=%s.jsonl.gz", symbol, date, jobID, leaseToken)
 }
 
-func stagePageKey(jobID, symbol, date string, page int) string {
-	return fmt.Sprintf("staging/provider=massive/job=%s/symbol=%s/date=%s/page=%06d.json.gz", jobID, symbol, date, page)
+func stagePageKey(jobID, symbol, date string, page int, leaseToken string) string {
+	return fmt.Sprintf("staging/provider=massive/job=%s/symbol=%s/date=%s/page=%06d/lease=%s.json.gz", jobID, symbol, date, page, leaseToken)
 }
 
 func wait(ctx context.Context, duration time.Duration) error {
@@ -1859,6 +1875,7 @@ func unitItem(unit unitState) map[string]dynamodbtypes.AttributeValue {
 		"cursor":              stringValue(unit.Cursor),
 		"page_number":         numberValue(unit.PageNumber),
 		"previous_ts":         numberValue(unit.PreviousTS),
+		"staged_pages":        jsonValue(unit.StageKeys),
 		"lease_token":         stringValue(unit.LeaseToken),
 		"lease_expires_at":    numberValue(unit.LeaseExpiresAt),
 		"expected_generation": stringValue(unit.ExpectedGeneration),
@@ -1922,7 +1939,8 @@ func unitFromItem(item map[string]dynamodbtypes.AttributeValue) unitState {
 		Status: stringAttribute(item, "status"), Attempts: int(numberAttribute(item, "attempts")), Rows: numberAttribute(item, "rows"),
 		InvalidRows: numberAttribute(item, "invalid_rows"), Error: stringAttribute(item, "error"), Cursor: stringAttribute(item, "cursor"),
 		PageNumber: int(numberAttribute(item, "page_number")), PreviousTS: numberAttribute(item, "previous_ts"), LeaseToken: stringAttribute(item, "lease_token"),
-		LeaseExpiresAt: numberAttribute(item, "lease_expires_at"), ExpectedGeneration: stringAttribute(item, "expected_generation"),
+		StageKeys: stringSliceJSONAttribute(item, "staged_pages"), LeaseExpiresAt: numberAttribute(item, "lease_expires_at"),
+		ExpectedGeneration: stringAttribute(item, "expected_generation"),
 	}
 }
 
@@ -1995,6 +2013,18 @@ func stringSetAttribute(item map[string]dynamodbtypes.AttributeValue, name strin
 	return append([]string(nil), value.Value...)
 }
 
+func stringSliceJSONAttribute(item map[string]dynamodbtypes.AttributeValue, name string) []string {
+	value := stringAttribute(item, name)
+	if value == "" {
+		return nil
+	}
+	var result []string
+	if json.Unmarshal([]byte(value), &result) != nil {
+		return nil
+	}
+	return result
+}
+
 func numberAttribute(item map[string]dynamodbtypes.AttributeValue, name string) int64 {
 	value, ok := item[name].(*dynamodbtypes.AttributeValueMemberN)
 	if !ok {
@@ -2011,5 +2041,10 @@ func boolAttribute(item map[string]dynamodbtypes.AttributeValue, name string) bo
 
 func isConditionalFailure(err error) bool {
 	var target *dynamodbtypes.ConditionalCheckFailedException
+	return errors.As(err, &target)
+}
+
+func isTransactionCanceled(err error) bool {
+	var target *dynamodbtypes.TransactionCanceledException
 	return errors.As(err, &target)
 }
