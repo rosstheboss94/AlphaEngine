@@ -111,6 +111,11 @@ Resources:
               - sqs:ReceiveMessage
               - sqs:SendMessage
             Resource: !GetAtt UnitQueue.Arn
+          - Sid: IngestionWorkflow
+            Effect: Allow
+            Action:
+              - states:StartExecution
+            Resource: !GetAtt IngestionStateMachine.Arn
           - Sid: IngestionObjects
             Effect: Allow
             Action:
@@ -128,6 +133,72 @@ Resources:
             Action:
               - secretsmanager:GetSecretValue
             Resource: !Ref MassiveSecretArn
+
+  IngestionStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DispatchIngestionUnits
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::${BucketName}/manifests/provider=massive/*
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt UnitQueue.Arn
+
+  IngestionStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt IngestionStateMachineRole.Arn
+      DefinitionString:
+        !Sub
+          - |
+            {
+              "StartAt": "DispatchUnits",
+              "States": {
+                "DispatchUnits": {
+                  "Type": "Map",
+                  "MaxConcurrency": 10,
+                  "ItemReader": {
+                    "Resource": "arn:${AWS::Partition}:states:::s3:getObject",
+                    "ReaderConfig": {"InputType": "JSON"},
+                    "Parameters": {"Bucket": "${ManifestBucket}", "Key.$": "$.manifest_key"}
+                  },
+                  "ItemProcessor": {
+                    "ProcessorConfig": {"Mode": "DISTRIBUTED", "ExecutionType": "STANDARD"},
+                    "StartAt": "SendUnit",
+                    "States": {
+                      "SendUnit": {
+                        "Type": "Task",
+                        "Resource": "arn:${AWS::Partition}:states:::sqs:sendMessage",
+                        "Parameters": {
+                          "QueueUrl": "${QueueUrl}",
+                          "MessageBody.$": "States.JsonToString($)"
+                        },
+                        "Retry": [{"ErrorEquals":["States.ALL"],"IntervalSeconds":5,"BackoffRate":2.0,"MaxAttempts":5}],
+                        "End": true
+                      }
+                    }
+                  },
+                  "End": true
+                }
+              }
+            }
+          - ManifestBucket: !Ref BucketName
+            QueueUrl: !Ref UnitQueue
 
   ControlFunction:
     Type: AWS::Lambda::Function
@@ -152,6 +223,7 @@ Resources:
           INGESTION_TABLE_NAME: !Ref TableName
           INGESTION_QUEUE_URL: !Ref UnitQueue
           INGESTION_WORKER_FUNCTION: !Ref WorkerFunction
+          INGESTION_STATE_MACHINE_ARN: !GetAtt IngestionStateMachine.Arn
 
   WorkerFunction:
     Type: AWS::Lambda::Function
@@ -175,6 +247,7 @@ Resources:
           BACKTEST_AWS_REGION: !Ref AWS::Region
           INGESTION_S3_BUCKET: !Ref BucketName
           INGESTION_TABLE_NAME: !Ref TableName
+          INGESTION_QUEUE_URL: !Ref UnitQueue
           MASSIVE_SECRET_ARN: !Ref MassiveSecretArn
 
   WorkerEventSource:
@@ -226,6 +299,8 @@ Outputs:
     Value: !GetAtt ControlFunction.Arn
   WorkerFunctionArn:
     Value: !GetAtt WorkerFunction.Arn
+  StateMachineArn:
+    Value: !GetAtt IngestionStateMachine.Arn
   QueueUrl:
     Value: !Ref UnitQueue
   TableName:

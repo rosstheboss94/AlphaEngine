@@ -15,22 +15,29 @@ import (
 
 func TestConfigFromEnvUsesSafeDefaultsAndRuntimeInputs(t *testing.T) {
 	values := map[string]string{
-		"INGESTION_S3_BUCKET":       "alphaengine-bucket",
-		"INGESTION_TABLE_NAME":      "ingestion",
-		"INGESTION_QUEUE_URL":       "https://sqs.us-east-1.amazonaws.com/queue.fifo",
-		"INGESTION_WORKER_FUNCTION": "worker",
-		"MASSIVE_SECRET_ARN":        "arn:aws:secretsmanager:us-east-1:123:secret:massive",
-		"INGESTION_MAX_UNITS":       "42",
+		"INGESTION_S3_BUCKET":         "alphaengine-bucket",
+		"INGESTION_TABLE_NAME":        "ingestion",
+		"INGESTION_QUEUE_URL":         "https://sqs.us-east-1.amazonaws.com/queue.fifo",
+		"INGESTION_WORKER_FUNCTION":   "worker",
+		"INGESTION_STATE_MACHINE_ARN": "arn:aws:states:us-east-1:123:stateMachine:ingestion",
+		"MASSIVE_SECRET_ARN":          "arn:aws:secretsmanager:us-east-1:123:secret:massive",
+		"INGESTION_MAX_UNITS":         "42",
 	}
 	cfg, err := ConfigFromEnv(func(key string) string { return values[key] })
 	if err != nil {
 		t.Fatalf("ConfigFromEnv() error = %v", err)
 	}
-	if cfg.Region != defaultAWSRegion || cfg.MaxUnits != 42 || cfg.MassiveSecretARN == "" {
+	if cfg.Region != defaultAWSRegion || cfg.MaxUnits != 42 || cfg.MassiveSecretARN == "" || cfg.StateMachineARN == "" {
 		t.Fatalf("unexpected config: %+v", cfg)
 	}
-	if err := (Config{Bucket: "bucket", TableName: "table", QueueURL: "queue", WorkerFunction: "worker"}).validateControl(); err != nil {
+	if err := (Config{Bucket: "bucket", TableName: "table", QueueURL: "queue", WorkerFunction: "worker", StateMachineARN: "state-machine"}).validateControl(); err != nil {
 		t.Fatalf("validateControl() error = %v", err)
+	}
+	if err := (Config{Bucket: "bucket", TableName: "table", QueueURL: "queue", MassiveSecretARN: "secret"}).validateWorker(); err != nil {
+		t.Fatalf("validateWorker() error = %v", err)
+	}
+	if err := (Config{Bucket: "bucket", TableName: "table", MassiveSecretARN: "secret"}).validateWorker(); err == nil {
+		t.Fatal("worker queue URL should be required")
 	}
 }
 
@@ -124,7 +131,7 @@ func TestUnitItemRoundTripsDurablePageAndLeaseState(t *testing.T) {
 	want := unitState{
 		JobID: "job-a", Symbol: "AAL", Date: "2024-01-02", Status: "waiting", Attempts: 2,
 		Rows: 10, InvalidRows: 1, Cursor: "https://api.massive.com/next", PageNumber: 3,
-		StageKeys:  []string{"staging/page-1.json.gz", "staging/page-2.json.gz"},
+		StageKeys: []string{"staging/page-1.json.gz", "staging/page-2.json.gz"}, NotBefore: 1704202300000,
 		PreviousTS: 1704202200000000000, LeaseToken: "lease-a", LeaseExpiresAt: 1704202400000,
 		ExpectedGeneration: "generation-a",
 	}

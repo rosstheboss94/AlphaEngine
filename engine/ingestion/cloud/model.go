@@ -26,6 +26,7 @@ type Config struct {
 	TableName        string
 	QueueURL         string
 	WorkerFunction   string
+	StateMachineARN  string
 	MassiveSecretARN string
 	MaxUnits         int
 }
@@ -40,6 +41,7 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 		TableName:        strings.TrimSpace(getenv("INGESTION_TABLE_NAME")),
 		QueueURL:         strings.TrimSpace(getenv("INGESTION_QUEUE_URL")),
 		WorkerFunction:   strings.TrimSpace(getenv("INGESTION_WORKER_FUNCTION")),
+		StateMachineARN:  strings.TrimSpace(getenv("INGESTION_STATE_MACHINE_ARN")),
 		MassiveSecretARN: strings.TrimSpace(getenv("MASSIVE_SECRET_ARN")),
 		MaxUnits:         defaultMaxUnits,
 	}
@@ -69,6 +71,9 @@ func (c Config) validateControl() error {
 	if c.WorkerFunction == "" {
 		return errors.New("INGESTION_WORKER_FUNCTION is required")
 	}
+	if c.StateMachineARN == "" {
+		return errors.New("INGESTION_STATE_MACHINE_ARN is required")
+	}
 	return nil
 }
 
@@ -78,6 +83,9 @@ func (c Config) validateWorker() error {
 	}
 	if c.TableName == "" {
 		return errors.New("INGESTION_TABLE_NAME is required")
+	}
+	if c.QueueURL == "" {
+		return errors.New("INGESTION_QUEUE_URL is required")
 	}
 	if c.MassiveSecretARN == "" && strings.TrimSpace(os.Getenv("MASSIVE_API_KEY")) == "" {
 		return errors.New("MASSIVE_SECRET_ARN is required")
@@ -121,6 +129,7 @@ type unitState struct {
 	PageNumber         int
 	PreviousTS         int64
 	StageKeys          []string
+	NotBefore          int64
 	LeaseToken         string
 	LeaseExpiresAt     int64
 	ExpectedGeneration string

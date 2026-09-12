@@ -3,10 +3,11 @@
 This stack deploys the two Go Lambdas used by the AlphaEngine Data page:
 
 - `control` validates commands, stores jobs and symbol lists in DynamoDB, and
-  publishes one durable SQS message per symbol/date unit.
+  writes an S3 unit manifest and starts a Step Functions Standard dispatcher.
+- the dispatcher sends one durable SQS message per symbol/date unit.
 - `worker` reads `MASSIVE_API_KEY` from Secrets Manager, fetches one complete
-  Massive unit, and writes Snappy Parquet or gzip JSON Lines quarantine objects
-  to the existing S3 bucket.
+  Massive unit page at a time, and writes Snappy Parquet or gzip JSON Lines
+  quarantine objects to the existing S3 bucket.
 
 The stack also creates the DynamoDB table, SQS unit queue and New York-time 06:00
 EventBridge Scheduler trigger. The existing `AlphaEngineServiceRole` is used by

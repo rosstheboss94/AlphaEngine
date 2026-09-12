@@ -10,6 +10,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/lambda v1.108.0
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.92.0
 	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.36.0
+	github.com/aws/aws-sdk-go-v2/service/sfn v1.50.0
 	github.com/aws/aws-sdk-go-v2/service/sqs v1.39.0
 	github.com/parquet-go/parquet-go v0.32.0
 	github.com/wailsapp/wails/v2 v2.12.0

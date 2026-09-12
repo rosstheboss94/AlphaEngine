@@ -28,6 +28,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
+	"github.com/aws/aws-sdk-go-v2/service/sfn"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
 	"github.com/parquet-go/parquet-go"
@@ -57,6 +58,7 @@ type Handler struct {
 	ddb     *dynamodb.Client
 	s3      *s3.Client
 	sqs     *sqs.Client
+	sfn     *sfn.Client
 	secrets *secretsmanager.Client
 	now     func() time.Time
 
@@ -99,6 +101,7 @@ func newHandler(ctx context.Context, cfg Config) (*Handler, error) {
 		ddb:     dynamodb.NewFromConfig(awsCfg),
 		s3:      s3.NewFromConfig(awsCfg),
 		sqs:     sqs.NewFromConfig(awsCfg),
+		sfn:     sfn.NewFromConfig(awsCfg),
 		secrets: secretsmanager.NewFromConfig(awsCfg),
 		now:     time.Now,
 	}, nil
@@ -338,6 +341,7 @@ func (h *Handler) startBackfillWithSource(ctx context.Context, raw json.RawMessa
 		"end":              stringValue(request.End),
 		"source":           stringValue(source),
 		"idempotency_key":  stringValue(requestKey),
+		"manifest_key":     stringValue(manifestObjectKey(jobID)),
 		"symbol_snapshot":  jsonValue(symbols),
 		"created_at":       stringValue(now),
 		"updated_at":       stringValue(now),
@@ -374,7 +378,7 @@ func (h *Handler) startBackfillWithSource(ctx context.Context, raw json.RawMessa
 		_ = h.markJobFailed(ctx, jobID, err.Error())
 		return ingestion.Job{}, err
 	}
-	if err := h.enqueue(ctx, messages); err != nil {
+	if err := h.startUnitDispatch(ctx, jobID, messages); err != nil {
 		_ = h.markJobFailed(ctx, jobID, err.Error())
 		return ingestion.Job{}, err
 	}
@@ -690,6 +694,7 @@ func (h *Handler) deleteDataUnit(ctx context.Context, symbol, date string) error
 		fmt.Sprintf("data/provider=massive/symbol=%s/date=%s/", symbol, date),
 		fmt.Sprintf("candidates/provider=massive/symbol=%s/date=%s/", symbol, date),
 		fmt.Sprintf("quarantine/provider=massive/symbol=%s/date=%s/", symbol, date),
+		fmt.Sprintf("staging/provider=massive/symbol=%s/date=%s/", symbol, date),
 	} {
 		if err := h.deleteObjectsWithPrefix(ctx, prefix); err != nil {
 			return err
@@ -724,11 +729,15 @@ func (h *Handler) deleteObjectsWithPrefix(ctx context.Context, prefix string) er
 		if len(identifiers) == 0 {
 			continue
 		}
-		_, err = h.s3.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+		output, err := h.s3.DeleteObjects(ctx, &s3.DeleteObjectsInput{
 			Bucket: aws.String(h.cfg.Bucket), Delete: &s3types.Delete{Objects: identifiers, Quiet: aws.Bool(true)},
 		})
 		if err != nil {
 			return fmt.Errorf("delete S3 objects under %q: %w", prefix, err)
+		}
+		if len(output.Errors) > 0 {
+			failure := output.Errors[0]
+			return fmt.Errorf("delete S3 objects under %q: object %q failed with %s: %s", prefix, aws.ToString(failure.Key), aws.ToString(failure.Code), aws.ToString(failure.Message))
 		}
 	}
 	return nil
@@ -763,6 +772,10 @@ func (h *Handler) handleUnit(ctx context.Context, message UnitMessage) error {
 	if !found || terminalUnitStatus(unit.Status) {
 		return nil
 	}
+	if unit.NotBefore > h.now().UTC().UnixMilli() {
+		delay := time.Duration(unit.NotBefore-h.now().UTC().UnixMilli()) * time.Millisecond
+		return h.enqueueWithDelay(ctx, []UnitMessage{message}, delay)
+	}
 	claimed := false
 	unit, claimed, err = h.claimUnit(ctx, unit)
 	if err != nil {
@@ -780,8 +793,12 @@ func (h *Handler) handleUnit(ctx context.Context, message UnitMessage) error {
 	}
 	if stringAttribute(dataItem, "status") == "deleted" {
 		if job.Source == "manual" && deletionPredatesJob(dataItem, job.CreatedAt) {
-			if err := h.clearExclusion(ctx, message.Symbol, message.Date); err != nil {
+			cleared, err := h.clearExclusion(ctx, message.Symbol, message.Date, stringAttribute(dataItem, "updated_at"))
+			if err != nil {
 				return h.retryUnit(ctx, unit, err)
+			}
+			if !cleared {
+				return h.finishUnit(ctx, unit, "cancelled", unit.Rows, unit.InvalidRows, "a newer deletion exclusion was recorded", "", "", "")
 			}
 			dataItem = nil
 		} else {
@@ -829,7 +846,7 @@ func (h *Handler) handleUnit(ctx context.Context, message UnitMessage) error {
 		return h.finishProviderError(ctx, message, unit, err)
 	}
 	stageKey := stagePageKey(message.JobID, message.Symbol, message.Date, pageNumber, unit.LeaseToken)
-	if err := h.putStagedPage(ctx, stageKey, stagedPage{Bars: result.Bars, Issues: result.Issues}); err != nil {
+	if err := h.putFencedStagedPage(ctx, unit, stageKey, stagedPage{Bars: result.Bars, Issues: result.Issues}); err != nil {
 		return h.retryUnit(ctx, unit, err)
 	}
 	if result.NextCursor != "" && result.NextCursor == unit.Cursor {
@@ -849,7 +866,7 @@ func (h *Handler) handleUnit(ctx context.Context, message UnitMessage) error {
 	quarantineKey := ""
 	if len(allIssues) > 0 {
 		quarantineKey = quarantineObjectKey(message.JobID, message.Symbol, message.Date, unit.LeaseToken)
-		if err := h.putQuarantine(ctx, quarantineKey, allIssues); err != nil {
+		if err := h.putFencedQuarantine(ctx, unit, quarantineKey, allIssues); err != nil {
 			return h.retryUnit(ctx, unit, err)
 		}
 	}
@@ -866,11 +883,11 @@ func (h *Handler) handleUnit(ctx context.Context, message UnitMessage) error {
 		}
 		if len(omitted) > 0 {
 			candidateKey := candidateObjectKey(message.JobID, message.Symbol, message.Date, unit.LeaseToken)
-			if err := h.putParquet(ctx, candidateKey, allBars); err != nil {
+			if err := h.putFencedParquet(ctx, unit, candidateKey, allBars); err != nil {
 				return h.retryUnit(ctx, unit, err)
 			}
 			candidateID := stableID("discrepancy", message.JobID, message.Symbol, message.Date, stringAttribute(dataItem, "generation"))
-			if err := h.recordCandidate(ctx, candidateState{
+			if err := h.recordCandidate(ctx, unit, candidateState{
 				ID: candidateID, JobID: message.JobID, Symbol: message.Symbol, Date: message.Date,
 				CurrentGeneration: stringAttribute(dataItem, "generation"), CurrentObjectKey: stringAttribute(dataItem, "object_key"),
 				CandidateKey: candidateKey, Omitted: omitted, Rows: int64(len(allBars)),
@@ -882,7 +899,7 @@ func (h *Handler) handleUnit(ctx context.Context, message UnitMessage) error {
 	}
 	if len(allIssues) > 0 {
 		candidateKey := candidateObjectKey(message.JobID, message.Symbol, message.Date, unit.LeaseToken)
-		if err := h.putParquet(ctx, candidateKey, allBars); err != nil {
+		if err := h.putFencedParquet(ctx, unit, candidateKey, allBars); err != nil {
 			return h.retryUnit(ctx, unit, err)
 		}
 		return h.finishUnit(ctx, unit, "incomplete", int64(len(allBars)), int64(len(allIssues)), "invalid rows were quarantined; candidate was not published", "", candidateKey, quarantineKey)
@@ -930,6 +947,20 @@ func (h *Handler) putStagedPage(ctx context.Context, objectKey string, page stag
 		ContentType: aws.String("application/json"), ContentEncoding: aws.String("gzip"),
 	}); err != nil {
 		return fmt.Errorf("write staged page %q: %w", objectKey, err)
+	}
+	return nil
+}
+
+func (h *Handler) putFencedStagedPage(ctx context.Context, unit unitState, objectKey string, page stagedPage) error {
+	if err := h.artifactFence(ctx, unit); err != nil {
+		return err
+	}
+	if err := h.putStagedPage(ctx, objectKey, page); err != nil {
+		return err
+	}
+	if err := h.artifactFence(ctx, unit); err != nil {
+		_, _ = h.s3.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(h.cfg.Bucket), Key: aws.String(objectKey)})
+		return err
 	}
 	return nil
 }
@@ -985,7 +1016,7 @@ func (h *Handler) checkpointPage(ctx context.Context, unit unitState, stageKey, 
 	_, err := h.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                aws.String(h.cfg.TableName),
 		Key:                      key(unitPartitionBase+unit.JobID, unitKey(unit.Symbol, unit.Date)),
-		UpdateExpression:         aws.String("SET #status = :waiting, cursor = :cursor, page_number = :page, previous_ts = :previous, rows = :rows, invalid_rows = :invalid, staged_pages = :staged_pages, expected_generation = :expected_generation, attempts = :zero, lease_token = :empty, lease_expires_at = :zero, updated_at = :updated"),
+		UpdateExpression:         aws.String("SET #status = :waiting, cursor = :cursor, page_number = :page, previous_ts = :previous, rows = :rows, invalid_rows = :invalid, staged_pages = :staged_pages, expected_generation = :expected_generation, not_before = :zero, lease_token = :empty, lease_expires_at = :zero, updated_at = :updated"),
 		ConditionExpression:      aws.String("#status = :running AND lease_token = :lease"),
 		ExpressionAttributeNames: map[string]string{"#status": "status"},
 		ExpressionAttributeValues: map[string]dynamodbtypes.AttributeValue{
@@ -993,7 +1024,7 @@ func (h *Handler) checkpointPage(ctx context.Context, unit unitState, stageKey, 
 			":previous": numberValue(previousTS), ":rows": numberValue(rows), ":invalid": numberValue(invalidRows),
 			":staged_pages":        jsonValue(stageKeys),
 			":expected_generation": stringValue(unit.ExpectedGeneration),
-			":zero":                numberValue(0), ":empty": stringValue(""), ":updated": stringValue(now.Format(time.RFC3339)),
+			":empty":               stringValue(""), ":zero": numberValue(0), ":updated": stringValue(now.Format(time.RFC3339)),
 			":lease": stringValue(unit.LeaseToken),
 		},
 	})
@@ -1029,11 +1060,12 @@ func (h *Handler) retryWithDelay(ctx context.Context, message UnitMessage, unit 
 	if unit.Attempts >= maxAttempts {
 		return h.finishUnit(ctx, unit, "failed", unit.Rows, unit.InvalidRows, cause.Error(), "", "", "")
 	}
-	delay := retryDelay(unit.Attempts)
+	delay := jitteredRetryDelay(retryDelay(unit.Attempts))
 	if retryAfter > delay {
 		delay = retryAfter
 	}
-	if err := h.releaseUnit(ctx, unit, cause.Error()); err != nil {
+	notBefore := h.now().UTC().Add(delay).UnixMilli()
+	if err := h.releaseUnit(ctx, unit, cause.Error(), notBefore); err != nil {
 		return err
 	}
 	if err := h.enqueueWithDelay(ctx, []UnitMessage{message}, delay); err != nil {
@@ -1042,15 +1074,15 @@ func (h *Handler) retryWithDelay(ctx context.Context, message UnitMessage, unit 
 	return nil
 }
 
-func (h *Handler) releaseUnit(ctx context.Context, unit unitState, message string) error {
+func (h *Handler) releaseUnit(ctx context.Context, unit unitState, message string, notBefore int64) error {
 	_, err := h.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: aws.String(h.cfg.TableName), Key: key(unitPartitionBase+unit.JobID, unitKey(unit.Symbol, unit.Date)),
-		UpdateExpression:         aws.String("SET #status = :waiting, #error = :error, lease_token = :empty, lease_expires_at = :zero, updated_at = :updated"),
+		UpdateExpression:         aws.String("SET #status = :waiting, #error = :error, not_before = :not_before, lease_token = :empty, lease_expires_at = :zero, updated_at = :updated"),
 		ConditionExpression:      aws.String("#status = :running AND lease_token = :lease"),
 		ExpressionAttributeNames: map[string]string{"#status": "status", "#error": "error"},
 		ExpressionAttributeValues: map[string]dynamodbtypes.AttributeValue{
 			":waiting": stringValue("waiting"), ":error": stringValue(message), ":empty": stringValue(""),
-			":zero": numberValue(0), ":updated": stringValue(h.now().UTC().Format(time.RFC3339)), ":lease": stringValue(unit.LeaseToken),
+			":zero": numberValue(0), ":not_before": numberValue(notBefore), ":updated": stringValue(h.now().UTC().Format(time.RFC3339)), ":lease": stringValue(unit.LeaseToken),
 		},
 	})
 	if err != nil && !isConditionalFailure(err) {
@@ -1074,6 +1106,17 @@ func retryDelay(attempt int) time.Duration {
 		return 15 * time.Minute
 	}
 	return delay
+}
+
+func jitteredRetryDelay(base time.Duration) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	var sample [1]byte
+	if _, err := cryptorand.Read(sample[:]); err != nil {
+		return base
+	}
+	return base + time.Duration(sample[0]%26)*base/100
 }
 
 func (h *Handler) massiveAPIKey(ctx context.Context) (string, error) {
@@ -1177,6 +1220,20 @@ func (h *Handler) putParquet(ctx context.Context, objectKey string, bars []inges
 	return nil
 }
 
+func (h *Handler) putFencedParquet(ctx context.Context, unit unitState, objectKey string, bars []ingestion.NormalizedBar) error {
+	if err := h.artifactFence(ctx, unit); err != nil {
+		return err
+	}
+	if err := h.putParquet(ctx, objectKey, bars); err != nil {
+		return err
+	}
+	if err := h.artifactFence(ctx, unit); err != nil {
+		_, _ = h.s3.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(h.cfg.Bucket), Key: aws.String(objectKey)})
+		return err
+	}
+	return nil
+}
+
 func encodeParquet(bars []ingestion.NormalizedBar) ([]byte, error) {
 	var buffer bytes.Buffer
 	writer := parquet.NewGenericWriter[parquetBar](&buffer, parquet.Compression(&snappy.Codec{}))
@@ -1214,6 +1271,20 @@ func (h *Handler) putQuarantine(ctx context.Context, objectKey string, issues []
 		ContentType: aws.String("application/x-ndjson"), ContentEncoding: aws.String("gzip"),
 	}); err != nil {
 		return fmt.Errorf("write quarantine object %q: %w", objectKey, err)
+	}
+	return nil
+}
+
+func (h *Handler) putFencedQuarantine(ctx context.Context, unit unitState, objectKey string, issues []ingestion.RowIssue) error {
+	if err := h.artifactFence(ctx, unit); err != nil {
+		return err
+	}
+	if err := h.putQuarantine(ctx, objectKey, issues); err != nil {
+		return err
+	}
+	if err := h.artifactFence(ctx, unit); err != nil {
+		_, _ = h.s3.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(h.cfg.Bucket), Key: aws.String(objectKey)})
+		return err
 	}
 	return nil
 }
@@ -1284,28 +1355,24 @@ type candidateState struct {
 	Status            string
 }
 
-func (h *Handler) recordCandidate(ctx context.Context, candidate candidateState) error {
-	if _, err := h.ddb.PutItem(ctx, &dynamodb.PutItemInput{
-		TableName: aws.String(h.cfg.TableName),
-		Item: map[string]dynamodbtypes.AttributeValue{
-			"pk":                 stringValue("CANDIDATE#" + candidate.ID),
-			"sk":                 stringValue(currentSortKey),
-			"gsi1pk":             stringValue(unitPartitionBase + candidate.JobID),
-			"gsi1sk":             stringValue("CANDIDATE#" + candidate.ID),
-			"entity":             stringValue("discrepancy_candidate"),
-			"id":                 stringValue(candidate.ID),
-			"job_id":             stringValue(candidate.JobID),
-			"symbol":             stringValue(candidate.Symbol),
-			"date":               stringValue(candidate.Date),
-			"current_generation": stringValue(candidate.CurrentGeneration),
-			"current_object_key": stringValue(candidate.CurrentObjectKey),
-			"candidate_key":      stringValue(candidate.CandidateKey),
-			"omitted":            jsonValue(candidate.Omitted),
-			"rows":               numberValue(candidate.Rows),
-			"status":             stringValue("pending"),
-			"created_at":         stringValue(h.now().UTC().Format(time.RFC3339)),
-		},
-	}); err != nil {
+func (h *Handler) recordCandidate(ctx context.Context, unit unitState, candidate candidateState) error {
+	item := map[string]dynamodbtypes.AttributeValue{
+		"pk": stringValue("CANDIDATE#" + candidate.ID), "sk": stringValue(currentSortKey),
+		"gsi1pk": stringValue(unitPartitionBase + candidate.JobID), "gsi1sk": stringValue("CANDIDATE#" + candidate.ID),
+		"entity": stringValue("discrepancy_candidate"), "id": stringValue(candidate.ID), "job_id": stringValue(candidate.JobID),
+		"symbol": stringValue(candidate.Symbol), "date": stringValue(candidate.Date),
+		"current_generation": stringValue(candidate.CurrentGeneration), "current_object_key": stringValue(candidate.CurrentObjectKey),
+		"candidate_key": stringValue(candidate.CandidateKey), "omitted": jsonValue(candidate.Omitted), "rows": numberValue(candidate.Rows),
+		"status": stringValue("pending"), "created_at": stringValue(h.now().UTC().Format(time.RFC3339)),
+	}
+	transactItems := append(h.artifactFenceItems(unit), dynamodbtypes.TransactWriteItem{Put: &dynamodbtypes.Put{
+		TableName: aws.String(h.cfg.TableName), Item: item,
+	}})
+	if _, err := h.ddb.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: transactItems}); err != nil {
+		if isConditionalFailure(err) || isTransactionCanceled(err) {
+			_, _ = h.s3.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(h.cfg.Bucket), Key: aws.String(candidate.CandidateKey)})
+			return errPublicationFence
+		}
 		return fmt.Errorf("record discrepancy candidate: %w", err)
 	}
 	return nil
@@ -1392,6 +1459,48 @@ func (h *Handler) publish(ctx context.Context, unit unitState, symbol, date, obj
 	return nil
 }
 
+func (h *Handler) artifactFence(ctx context.Context, unit unitState) error {
+	_, err := h.ddb.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: h.artifactFenceItems(unit)})
+	if err != nil {
+		if isConditionalFailure(err) || isTransactionCanceled(err) {
+			return errPublicationFence
+		}
+		return fmt.Errorf("check ingestion artifact fence: %w", err)
+	}
+	return nil
+}
+
+func (h *Handler) artifactFenceItems(unit unitState) []dynamodbtypes.TransactWriteItem {
+	now := h.now().UTC()
+	dataCondition := "attribute_not_exists(#status)"
+	dataValues := map[string]dynamodbtypes.AttributeValue{":current": stringValue("current")}
+	if unit.ExpectedGeneration != "" && unit.ExpectedGeneration != generationAbsent {
+		dataCondition = "#status = :current AND generation = :expected_generation"
+		dataValues[":expected_generation"] = stringValue(unit.ExpectedGeneration)
+	}
+	return []dynamodbtypes.TransactWriteItem{
+		{ConditionCheck: &dynamodbtypes.ConditionCheck{
+			TableName: aws.String(h.cfg.TableName), Key: key(jobPartition, jobSortPrefix+unit.JobID),
+			ConditionExpression:      aws.String("#status IN (:queued, :running, :waiting)"),
+			ExpressionAttributeNames: map[string]string{"#status": "status"}, ExpressionAttributeValues: map[string]dynamodbtypes.AttributeValue{
+				":queued": stringValue("queued"), ":running": stringValue("running"), ":waiting": stringValue("waiting"),
+			},
+		}},
+		{ConditionCheck: &dynamodbtypes.ConditionCheck{
+			TableName: aws.String(h.cfg.TableName), Key: key(unitPartitionBase+unit.JobID, unitKey(unit.Symbol, unit.Date)),
+			ConditionExpression:      aws.String("#status = :running AND lease_token = :lease AND lease_expires_at > :now"),
+			ExpressionAttributeNames: map[string]string{"#status": "status"}, ExpressionAttributeValues: map[string]dynamodbtypes.AttributeValue{
+				":running": stringValue("running"), ":lease": stringValue(unit.LeaseToken), ":now": numberValue(now.UnixMilli()),
+			},
+		}},
+		{ConditionCheck: &dynamodbtypes.ConditionCheck{
+			TableName: aws.String(h.cfg.TableName), Key: key(dataKey(unit.Symbol, unit.Date), currentSortKey),
+			ConditionExpression: aws.String(dataCondition), ExpressionAttributeNames: map[string]string{"#status": "status"},
+			ExpressionAttributeValues: dataValues,
+		}},
+	}
+}
+
 func (h *Handler) claimUnit(ctx context.Context, unit unitState) (unitState, bool, error) {
 	attempt := unit.Attempts + 1
 	leaseToken, err := randomID("lease")
@@ -1403,7 +1512,7 @@ func (h *Handler) claimUnit(ctx context.Context, unit unitState) (unitState, boo
 		TableName:                aws.String(h.cfg.TableName),
 		Key:                      key(unitPartitionBase+unit.JobID, unitKey(unit.Symbol, unit.Date)),
 		UpdateExpression:         aws.String("SET #status = :running, attempts = :attempts, last_attempt = :last_attempt, lease_token = :lease, lease_expires_at = :expires, updated_at = :updated"),
-		ConditionExpression:      aws.String("#status IN (:queued, :waiting) OR (#status = :running AND (attribute_not_exists(lease_expires_at) OR lease_expires_at <= :now))"),
+		ConditionExpression:      aws.String("(#status IN (:queued, :waiting) AND (attribute_not_exists(not_before) OR not_before <= :now)) OR (#status = :running AND (attribute_not_exists(lease_expires_at) OR lease_expires_at <= :now))"),
 		ExpressionAttributeNames: map[string]string{"#status": "status"},
 		ExpressionAttributeValues: map[string]dynamodbtypes.AttributeValue{
 			":running":      stringValue("running"),
@@ -1447,7 +1556,7 @@ func (h *Handler) finishUnit(ctx context.Context, unit unitState, status string,
 	if _, err := h.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                 aws.String(h.cfg.TableName),
 		Key:                       key(unitPartitionBase+unit.JobID, unitKey(unit.Symbol, unit.Date)),
-		UpdateExpression:          aws.String("SET #status = :status, rows = :rows, invalid_rows = :invalid, #error = :error, object_key = :object_key, candidate_key = :candidate, quarantine_key = :quarantine, lease_token = :empty, lease_expires_at = :zero, updated_at = :updated"),
+		UpdateExpression:          aws.String("SET #status = :status, rows = :rows, invalid_rows = :invalid, #error = :error, object_key = :object_key, candidate_key = :candidate, quarantine_key = :quarantine, not_before = :zero, lease_token = :empty, lease_expires_at = :zero, updated_at = :updated"),
 		ConditionExpression:       aws.String("#status = :running AND lease_token = :lease"),
 		ExpressionAttributeNames:  map[string]string{"#status": "status", "#error": "error"},
 		ExpressionAttributeValues: values,
@@ -1522,7 +1631,7 @@ func (h *Handler) adjustJob(ctx context.Context, previous unitState, nextStatus 
 func (h *Handler) resetUnit(ctx context.Context, unit unitState) error {
 	if _, err := h.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: aws.String(h.cfg.TableName), Key: key(unitPartitionBase+unit.JobID, unitKey(unit.Symbol, unit.Date)),
-		UpdateExpression:         aws.String("SET #status = :waiting, attempts = :zero, rows = :zero, invalid_rows = :zero, #error = :empty, object_key = :empty, candidate_key = :empty, quarantine_key = :empty, cursor = :empty, staged_pages = :empty, page_number = :zero, previous_ts = :zero, expected_generation = :empty, lease_token = :empty, lease_expires_at = :zero, updated_at = :updated"),
+		UpdateExpression:         aws.String("SET #status = :waiting, attempts = :zero, #error = :empty, object_key = :empty, candidate_key = :empty, quarantine_key = :empty, not_before = :zero, lease_token = :empty, lease_expires_at = :zero, updated_at = :updated"),
 		ConditionExpression:      aws.String("#status IN (:failed, :incomplete, :attention)"),
 		ExpressionAttributeNames: map[string]string{"#status": "status", "#error": "error"},
 		ExpressionAttributeValues: map[string]dynamodbtypes.AttributeValue{
@@ -1606,18 +1715,20 @@ func (h *Handler) isDeleted(ctx context.Context, symbol, date string) (bool, err
 	return stringAttribute(item, "status") == "deleted", nil
 }
 
-func (h *Handler) clearExclusion(ctx context.Context, symbol, date string) error {
-	item, err := h.getDataItem(ctx, symbol, date)
+func (h *Handler) clearExclusion(ctx context.Context, symbol, date, deletedAt string) (bool, error) {
+	_, err := h.ddb.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+		TableName: aws.String(h.cfg.TableName), Key: key(dataKey(symbol, date), currentSortKey),
+		ConditionExpression:       aws.String("#status = :deleted AND updated_at = :deleted_at"),
+		ExpressionAttributeNames:  map[string]string{"#status": "status"},
+		ExpressionAttributeValues: map[string]dynamodbtypes.AttributeValue{":deleted": stringValue("deleted"), ":deleted_at": stringValue(deletedAt)},
+	})
 	if err != nil {
-		return err
+		if isConditionalFailure(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("clear data exclusion: %w", err)
 	}
-	if stringAttribute(item, "status") != "deleted" {
-		return nil
-	}
-	if _, err := h.ddb.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(h.cfg.TableName), Key: key(dataKey(symbol, date), currentSortKey)}); err != nil {
-		return fmt.Errorf("clear data exclusion: %w", err)
-	}
-	return nil
+	return true, nil
 }
 
 func deletionPredatesJob(item map[string]dynamodbtypes.AttributeValue, createdAt string) bool {
@@ -1663,6 +1774,34 @@ func (h *Handler) batchWrite(ctx context.Context, requests []dynamodbtypes.Write
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+func (h *Handler) startUnitDispatch(ctx context.Context, jobID string, messages []UnitMessage) error {
+	manifestKey := manifestObjectKey(jobID)
+	data, err := json.Marshal(messages)
+	if err != nil {
+		return fmt.Errorf("encode ingestion manifest: %w", err)
+	}
+	if _, err := h.s3.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(h.cfg.Bucket), Key: aws.String(manifestKey), Body: bytes.NewReader(data),
+		ContentType: aws.String("application/json"),
+	}); err != nil {
+		return fmt.Errorf("write ingestion manifest: %w", err)
+	}
+	input, err := json.Marshal(map[string]string{"job_id": jobID, "manifest_key": manifestKey})
+	if err != nil {
+		return fmt.Errorf("encode ingestion workflow input: %w", err)
+	}
+	_, err = h.sfn.StartExecution(ctx, &sfn.StartExecutionInput{
+		StateMachineArn: aws.String(h.cfg.StateMachineARN),
+		Name:            aws.String(stableID("execution", jobID)),
+		Input:           aws.String(string(input)),
+	})
+	if err != nil && !strings.Contains(err.Error(), "ExecutionAlreadyExists") {
+		_, _ = h.s3.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(h.cfg.Bucket), Key: aws.String(manifestKey)})
+		return fmt.Errorf("start ingestion workflow: %w", err)
 	}
 	return nil
 }
@@ -1793,7 +1932,11 @@ func quarantineObjectKey(jobID, symbol, date, leaseToken string) string {
 }
 
 func stagePageKey(jobID, symbol, date string, page int, leaseToken string) string {
-	return fmt.Sprintf("staging/provider=massive/job=%s/symbol=%s/date=%s/page=%06d/lease=%s.json.gz", jobID, symbol, date, page, leaseToken)
+	return fmt.Sprintf("staging/provider=massive/symbol=%s/date=%s/job=%s/page=%06d/lease=%s.json.gz", symbol, date, jobID, page, leaseToken)
+}
+
+func manifestObjectKey(jobID string) string {
+	return fmt.Sprintf("manifests/provider=massive/job=%s/units.json", jobID)
 }
 
 func wait(ctx context.Context, duration time.Duration) error {
@@ -1876,6 +2019,7 @@ func unitItem(unit unitState) map[string]dynamodbtypes.AttributeValue {
 		"page_number":         numberValue(unit.PageNumber),
 		"previous_ts":         numberValue(unit.PreviousTS),
 		"staged_pages":        jsonValue(unit.StageKeys),
+		"not_before":          numberValue(unit.NotBefore),
 		"lease_token":         stringValue(unit.LeaseToken),
 		"lease_expires_at":    numberValue(unit.LeaseExpiresAt),
 		"expected_generation": stringValue(unit.ExpectedGeneration),
@@ -1939,7 +2083,7 @@ func unitFromItem(item map[string]dynamodbtypes.AttributeValue) unitState {
 		Status: stringAttribute(item, "status"), Attempts: int(numberAttribute(item, "attempts")), Rows: numberAttribute(item, "rows"),
 		InvalidRows: numberAttribute(item, "invalid_rows"), Error: stringAttribute(item, "error"), Cursor: stringAttribute(item, "cursor"),
 		PageNumber: int(numberAttribute(item, "page_number")), PreviousTS: numberAttribute(item, "previous_ts"), LeaseToken: stringAttribute(item, "lease_token"),
-		StageKeys: stringSliceJSONAttribute(item, "staged_pages"), LeaseExpiresAt: numberAttribute(item, "lease_expires_at"),
+		StageKeys: stringSliceJSONAttribute(item, "staged_pages"), NotBefore: numberAttribute(item, "not_before"), LeaseExpiresAt: numberAttribute(item, "lease_expires_at"),
 		ExpectedGeneration: stringAttribute(item, "expected_generation"),
 	}
 }

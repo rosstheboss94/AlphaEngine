@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"math"
 	"math/big"
 	"net/http"
@@ -199,18 +198,17 @@ type pageResult struct {
 func (c *MassiveClient) fetchPage(ctx context.Context, pageURL string, request FetchRequest, pageNumber int, previous time.Time) (pageResult, string, error) {
 	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL, nil)
 	if err != nil {
-		return pageResult{}, "", &ProviderError{Kind: "transport", Message: "build Massive request: " + err.Error()}
+		return pageResult{}, "", &ProviderError{Kind: "transport", Message: "build Massive request failed"}
 	}
 	response, err := c.HTTPClient.Do(httpRequest)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return pageResult{}, "", err
 		}
-		return pageResult{}, "", &ProviderError{Kind: "transport", Message: err.Error()}
+		return pageResult{}, "", &ProviderError{Kind: "transport", Message: "Massive request failed"}
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
 		kind := "provider"
 		switch {
 		case response.StatusCode == http.StatusUnauthorized:
@@ -222,7 +220,7 @@ func (c *MassiveClient) fetchPage(ctx context.Context, pageURL string, request F
 		case response.StatusCode >= 500:
 			kind = "server"
 		}
-		return pageResult{}, "", &ProviderError{Kind: kind, StatusCode: response.StatusCode, Message: strings.TrimSpace(string(body)), RetryAfter: retryAfter(response.Header.Get("Retry-After"))}
+		return pageResult{}, "", &ProviderError{Kind: kind, StatusCode: response.StatusCode, Message: "provider request failed", RetryAfter: retryAfter(response.Header.Get("Retry-After"))}
 	}
 	var payload struct {
 		Results []json.RawMessage `json:"results"`

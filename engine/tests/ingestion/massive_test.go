@@ -2,6 +2,7 @@ package ingestion_test
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +11,12 @@ import (
 
 	"backtest_engine/engine/ingestion"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return fn(request)
+}
 
 func TestMassiveFetchUnitNormalizesPagesAndQuarantinesRows(t *testing.T) {
 	var requests int
@@ -144,5 +151,19 @@ func TestMassiveFetchUnitRejectsAdjustedRequests(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "unadjusted") {
 		t.Fatalf("expected adjusted request rejection, got %v", err)
+	}
+}
+
+func TestMassiveTransportErrorsNeverEchoCredentialURL(t *testing.T) {
+	client := ingestion.NewMassiveClient("secret", &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return nil, errors.New("dial failed for " + request.URL.String())
+	})})
+	client.BaseURL = "https://api.massive.com"
+	start := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	_, err := client.FetchPage(context.Background(), ingestion.PageRequest{FetchRequest: ingestion.FetchRequest{
+		Symbol: "AAL", StartDate: start, EndDate: start,
+	}})
+	if err == nil || strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), "apiKey") {
+		t.Fatalf("transport error leaked request credentials: %v", err)
 	}
 }
