@@ -2,6 +2,8 @@
 /app/wailsjs/
 /app/node_modules/
 /build/bin/
+.env
+!.env.example
 .agents
 /specs
 /images

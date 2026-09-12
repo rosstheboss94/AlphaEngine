@@ -1,5 +1,5 @@
 # Infrastructure as code
 
-Reserved for future Terraform configuration for AWS resources. Keep reusable
-modules separate from environment-specific state and variable files when this
-work begins.
+The [Massive ingestion stack](massive-ingestion/README.md) contains the current
+CloudFormation deployment for the control and worker Lambdas, DynamoDB state,
+SQS queue and daily Scheduler trigger.

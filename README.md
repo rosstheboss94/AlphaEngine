@@ -69,12 +69,12 @@ $env:BACKTEST_INGESTION_CONTROL_ARN = "arn:aws:lambda:..."
 wails dev
 ```
 
-The profile must be allowed to invoke the separately deployed control Lambda.
-The Massive key belongs in AWS Secrets Manager and is read by the cloud
-worker. The desktop does not accept or log provider keys. The control Lambda
-receives commands with an `action` and `input` JSON object, as defined by the
-ingestion contracts. Deploying the control and worker Lambdas remains outside
-this repository slice.
+The profile must be allowed to invoke the deployed control Lambda. The Massive
+key belongs in AWS Secrets Manager and is read by the cloud worker. The desktop
+does not accept or log provider keys. The control Lambda receives commands with
+an `action` and `input` JSON object, as defined by the ingestion contracts. The
+CloudFormation template and deployment script live in
+[`iac/massive-ingestion`](iac/massive-ingestion/README.md).
 
 ## Checks
 

@@ -190,6 +190,22 @@ func validateSymbols(symbols []string) error {
 	return nil
 }
 
+// ValidateSymbols checks the symbol rules shared by the desktop and cloud
+// ingestion boundaries.
+func ValidateSymbols(symbols []string) error {
+	return validateSymbols(symbols)
+}
+
+// NormalizeSymbols returns the canonical uppercase representation while
+// preserving the caller's order.
+func NormalizeSymbols(symbols []string) []string {
+	normalized := make([]string, 0, len(symbols))
+	for _, symbol := range symbols {
+		normalized = append(normalized, strings.ToUpper(strings.TrimSpace(symbol)))
+	}
+	return normalized
+}
+
 func validateRange(symbols []string, start, end string) error {
 	if len(symbols) == 0 || len(symbols) > 100 {
 		return errors.New("select between 1 and 100 symbols")
@@ -213,6 +229,11 @@ func validateDateRange(start, end string) error {
 		return errors.New("end must be on or after start")
 	}
 	return nil
+}
+
+// ValidateDateRange checks an inclusive YYYY-MM-DD range.
+func ValidateDateRange(start, end string) error {
+	return validateDateRange(start, end)
 }
 
 func parseDate(value string) (time.Time, error) {
