@@ -21,14 +21,15 @@ const (
 // Config is the non-secret runtime configuration for both Lambda handlers.
 // The provider key is deliberately not represented here.
 type Config struct {
-	Region           string
-	Bucket           string
-	TableName        string
-	QueueURL         string
-	WorkerFunction   string
-	StateMachineARN  string
-	MassiveSecretARN string
-	MaxUnits         int
+	Region            string
+	Bucket            string
+	TableName         string
+	QueueURL          string
+	ScheduledQueueURL string
+	WorkerFunction    string
+	StateMachineARN   string
+	MassiveSecretARN  string
+	MaxUnits          int
 }
 
 func ConfigFromEnv(getenv func(string) string) (Config, error) {
@@ -36,14 +37,15 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 		getenv = os.Getenv
 	}
 	cfg := Config{
-		Region:           strings.TrimSpace(getenv("BACKTEST_AWS_REGION")),
-		Bucket:           strings.TrimSpace(getenv("INGESTION_S3_BUCKET")),
-		TableName:        strings.TrimSpace(getenv("INGESTION_TABLE_NAME")),
-		QueueURL:         strings.TrimSpace(getenv("INGESTION_QUEUE_URL")),
-		WorkerFunction:   strings.TrimSpace(getenv("INGESTION_WORKER_FUNCTION")),
-		StateMachineARN:  strings.TrimSpace(getenv("INGESTION_STATE_MACHINE_ARN")),
-		MassiveSecretARN: strings.TrimSpace(getenv("MASSIVE_SECRET_ARN")),
-		MaxUnits:         defaultMaxUnits,
+		Region:            strings.TrimSpace(getenv("BACKTEST_AWS_REGION")),
+		Bucket:            strings.TrimSpace(getenv("INGESTION_S3_BUCKET")),
+		TableName:         strings.TrimSpace(getenv("INGESTION_TABLE_NAME")),
+		QueueURL:          strings.TrimSpace(getenv("INGESTION_QUEUE_URL")),
+		ScheduledQueueURL: strings.TrimSpace(getenv("INGESTION_SCHEDULED_QUEUE_URL")),
+		WorkerFunction:    strings.TrimSpace(getenv("INGESTION_WORKER_FUNCTION")),
+		StateMachineARN:   strings.TrimSpace(getenv("INGESTION_STATE_MACHINE_ARN")),
+		MassiveSecretARN:  strings.TrimSpace(getenv("MASSIVE_SECRET_ARN")),
+		MaxUnits:          defaultMaxUnits,
 	}
 	if cfg.Region == "" {
 		cfg.Region = defaultAWSRegion
@@ -67,6 +69,9 @@ func (c Config) validateControl() error {
 	}
 	if c.QueueURL == "" {
 		return errors.New("INGESTION_QUEUE_URL is required")
+	}
+	if c.ScheduledQueueURL == "" {
+		return errors.New("INGESTION_SCHEDULED_QUEUE_URL is required")
 	}
 	if c.WorkerFunction == "" {
 		return errors.New("INGESTION_WORKER_FUNCTION is required")
@@ -101,9 +106,10 @@ type Command struct {
 
 // UnitMessage is the durable queue payload for one symbol/date unit.
 type UnitMessage struct {
-	JobID  string `json:"job_id"`
-	Symbol string `json:"symbol"`
-	Date   string `json:"date"`
+	JobID    string `json:"job_id"`
+	Symbol   string `json:"symbol"`
+	Date     string `json:"date"`
+	QueueURL string `json:"queue_url,omitempty"`
 }
 
 // QueueEvent is intentionally compatible with the Lambda SQS event shape.
@@ -129,6 +135,7 @@ type unitState struct {
 	PageNumber         int
 	PreviousTS         int64
 	StageKeys          []string
+	QueueURL           string
 	NotBefore          int64
 	LeaseToken         string
 	LeaseExpiresAt     int64

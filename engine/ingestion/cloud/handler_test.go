@@ -15,13 +15,14 @@ import (
 
 func TestConfigFromEnvUsesSafeDefaultsAndRuntimeInputs(t *testing.T) {
 	values := map[string]string{
-		"INGESTION_S3_BUCKET":         "alphaengine-bucket",
-		"INGESTION_TABLE_NAME":        "ingestion",
-		"INGESTION_QUEUE_URL":         "https://sqs.us-east-1.amazonaws.com/queue.fifo",
-		"INGESTION_WORKER_FUNCTION":   "worker",
-		"INGESTION_STATE_MACHINE_ARN": "arn:aws:states:us-east-1:123:stateMachine:ingestion",
-		"MASSIVE_SECRET_ARN":          "arn:aws:secretsmanager:us-east-1:123:secret:massive",
-		"INGESTION_MAX_UNITS":         "42",
+		"INGESTION_S3_BUCKET":           "alphaengine-bucket",
+		"INGESTION_TABLE_NAME":          "ingestion",
+		"INGESTION_QUEUE_URL":           "https://sqs.us-east-1.amazonaws.com/queue.fifo",
+		"INGESTION_SCHEDULED_QUEUE_URL": "https://sqs.us-east-1.amazonaws.com/scheduled",
+		"INGESTION_WORKER_FUNCTION":     "worker",
+		"INGESTION_STATE_MACHINE_ARN":   "arn:aws:states:us-east-1:123:stateMachine:ingestion",
+		"MASSIVE_SECRET_ARN":            "arn:aws:secretsmanager:us-east-1:123:secret:massive",
+		"INGESTION_MAX_UNITS":           "42",
 	}
 	cfg, err := ConfigFromEnv(func(key string) string { return values[key] })
 	if err != nil {
@@ -30,7 +31,7 @@ func TestConfigFromEnvUsesSafeDefaultsAndRuntimeInputs(t *testing.T) {
 	if cfg.Region != defaultAWSRegion || cfg.MaxUnits != 42 || cfg.MassiveSecretARN == "" || cfg.StateMachineARN == "" {
 		t.Fatalf("unexpected config: %+v", cfg)
 	}
-	if err := (Config{Bucket: "bucket", TableName: "table", QueueURL: "queue", WorkerFunction: "worker", StateMachineARN: "state-machine"}).validateControl(); err != nil {
+	if err := (Config{Bucket: "bucket", TableName: "table", QueueURL: "queue", ScheduledQueueURL: "scheduled", WorkerFunction: "worker", StateMachineARN: "state-machine"}).validateControl(); err != nil {
 		t.Fatalf("validateControl() error = %v", err)
 	}
 	if err := (Config{Bucket: "bucket", TableName: "table", QueueURL: "queue", MassiveSecretARN: "secret"}).validateWorker(); err != nil {
@@ -132,6 +133,7 @@ func TestUnitItemRoundTripsDurablePageAndLeaseState(t *testing.T) {
 		JobID: "job-a", Symbol: "AAL", Date: "2024-01-02", Status: "waiting", Attempts: 2,
 		Rows: 10, InvalidRows: 1, Cursor: "https://api.massive.com/next", PageNumber: 3,
 		StageKeys: []string{"staging/page-1.json.gz", "staging/page-2.json.gz"}, NotBefore: 1704202300000,
+		QueueURL:   "https://sqs.us-east-1.amazonaws.com/queue",
 		PreviousTS: 1704202200000000000, LeaseToken: "lease-a", LeaseExpiresAt: 1704202400000,
 		ExpectedGeneration: "generation-a",
 	}
@@ -144,6 +146,18 @@ func TestUnitItemRoundTripsDurablePageAndLeaseState(t *testing.T) {
 func TestRetryDelayUsesBoundedExponentialBackoff(t *testing.T) {
 	if retryDelay(1) != 15*time.Second || retryDelay(2) != 30*time.Second || retryDelay(5) != 4*time.Minute || retryDelay(7) != 15*time.Minute {
 		t.Fatalf("unexpected retry delays: %s, %s, %s, %s", retryDelay(1), retryDelay(2), retryDelay(5), retryDelay(7))
+	}
+}
+
+func TestPageContinuationDoesNotConsumeUnitRetryBudget(t *testing.T) {
+	if claimAttempt(unitState{}) != 1 {
+		t.Fatal("initial unit claim should count as the first attempt")
+	}
+	if claimAttempt(unitState{Attempts: 1, Cursor: "https://api.massive.com/next"}) != 1 {
+		t.Fatal("successful page continuation should retain the attempt count")
+	}
+	if claimAttempt(unitState{Attempts: 1, NotBefore: 1704202300000}) != 2 {
+		t.Fatal("a delayed retry should consume the next attempt")
 	}
 }
 

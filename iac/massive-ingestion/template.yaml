@@ -17,6 +17,9 @@ Parameters:
   QueueName:
     Type: String
     Default: alphaengine-ingestion
+  ScheduledQueueName:
+    Type: String
+    Default: alphaengine-ingestion-scheduled
   ControlCodeKey:
     Type: String
   WorkerCodeKey:
@@ -39,6 +42,10 @@ Resources:
           AttributeType: S
         - AttributeName: gsi1sk
           AttributeType: S
+        - AttributeName: gsi2pk
+          AttributeType: S
+        - AttributeName: gsi2sk
+          AttributeType: S
       KeySchema:
         - AttributeName: pk
           KeyType: HASH
@@ -53,8 +60,19 @@ Resources:
               KeyType: RANGE
           Projection:
             ProjectionType: ALL
+        - IndexName: IngestionDataIndex
+          KeySchema:
+            - AttributeName: gsi2pk
+              KeyType: HASH
+            - AttributeName: gsi2sk
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
       SSESpecification:
         SSEEnabled: true
 
@@ -71,6 +89,21 @@ Resources:
       MessageRetentionPeriod: 1209600
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt UnitDeadLetterQueue.Arn
+        maxReceiveCount: 5
+
+  ScheduledUnitDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+
+  ScheduledUnitQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Ref ScheduledQueueName
+      VisibilityTimeout: 360
+      MessageRetentionPeriod: 1209600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ScheduledUnitDeadLetterQueue.Arn
         maxReceiveCount: 5
 
   IngestionPermissions:
@@ -102,6 +135,7 @@ Resources:
             Resource:
               - !GetAtt IngestionTable.Arn
               - !Sub ${IngestionTable.Arn}/index/IngestionIndex
+              - !Sub ${IngestionTable.Arn}/index/IngestionDataIndex
           - Sid: IngestionQueue
             Effect: Allow
             Action:
@@ -110,7 +144,9 @@ Resources:
               - sqs:GetQueueAttributes
               - sqs:ReceiveMessage
               - sqs:SendMessage
-            Resource: !GetAtt UnitQueue.Arn
+            Resource:
+              - !GetAtt UnitQueue.Arn
+              - !GetAtt ScheduledUnitQueue.Arn
           - Sid: IngestionWorkflow
             Effect: Allow
             Action:
@@ -156,11 +192,22 @@ Resources:
               - Effect: Allow
                 Action:
                   - sqs:SendMessage
-                Resource: !GetAtt UnitQueue.Arn
+                Resource:
+                  - !GetAtt UnitQueue.Arn
+                  - !GetAtt ScheduledUnitQueue.Arn
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Sub arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${AWS::StackName}-dispatcher
+              - Effect: Allow
+                Action:
+                  - states:DescribeExecution
+                Resource: !Sub arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:execution:${AWS::StackName}-dispatcher:*
 
   IngestionStateMachine:
     Type: AWS::StepFunctions::StateMachine
     Properties:
+      StateMachineName: !Sub ${AWS::StackName}-dispatcher
       StateMachineType: STANDARD
       RoleArn: !GetAtt IngestionStateMachineRole.Arn
       DefinitionString:
@@ -185,7 +232,7 @@ Resources:
                         "Type": "Task",
                         "Resource": "arn:${AWS::Partition}:states:::sqs:sendMessage",
                         "Parameters": {
-                          "QueueUrl": "${QueueUrl}",
+                          "QueueUrl.$": "$.queue_url",
                           "MessageBody.$": "States.JsonToString($)"
                         },
                         "Retry": [{"ErrorEquals":["States.ALL"],"IntervalSeconds":5,"BackoffRate":2.0,"MaxAttempts":5}],
@@ -222,6 +269,7 @@ Resources:
           INGESTION_S3_BUCKET: !Ref BucketName
           INGESTION_TABLE_NAME: !Ref TableName
           INGESTION_QUEUE_URL: !Ref UnitQueue
+          INGESTION_SCHEDULED_QUEUE_URL: !Ref ScheduledUnitQueue
           INGESTION_WORKER_FUNCTION: !Ref WorkerFunction
           INGESTION_STATE_MACHINE_ARN: !GetAtt IngestionStateMachine.Arn
 
@@ -256,6 +304,16 @@ Resources:
       BatchSize: 1
       Enabled: true
       EventSourceArn: !GetAtt UnitQueue.Arn
+      FunctionName: !Ref WorkerFunction
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+  ScheduledWorkerEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      Enabled: true
+      EventSourceArn: !GetAtt ScheduledUnitQueue.Arn
       FunctionName: !Ref WorkerFunction
       FunctionResponseTypes:
         - ReportBatchItemFailures
@@ -303,6 +361,8 @@ Outputs:
     Value: !GetAtt IngestionStateMachine.Arn
   QueueUrl:
     Value: !Ref UnitQueue
+  ScheduledQueueUrl:
+    Value: !Ref ScheduledUnitQueue
   TableName:
     Value: !Ref IngestionTable
   ScheduleArn:

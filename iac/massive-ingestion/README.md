@@ -9,10 +9,13 @@ This stack deploys the two Go Lambdas used by the AlphaEngine Data page:
   Massive unit page at a time, and writes Snappy Parquet or gzip JSON Lines
   quarantine objects to the existing S3 bucket.
 
-The stack also creates the DynamoDB table, SQS unit queue and New York-time 06:00
-EventBridge Scheduler trigger. The existing `AlphaEngineServiceRole` is used by
-both Lambdas. A separate scheduler role is created because EventBridge Scheduler
-and Lambda require different trust policies.
+The stack also creates the DynamoDB table, separate manual and scheduled SQS
+unit queues, the Step Functions Standard dispatcher, and the New York-time
+06:00 EventBridge Scheduler trigger. Separate queues keep scheduled refreshes
+from sitting behind a large manual backfill. The existing
+`AlphaEngineServiceRole` is used by both Lambdas. Separate scheduler and
+workflow roles are created because those services require different trust
+policies.
 
 From the repository root, put the provider key in the existing untracked `.env`
 file and run:
