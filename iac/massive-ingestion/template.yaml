@@ -1,0 +1,369 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Durable Massive market-data ingestion for AlphaEngine.
+
+Parameters:
+  BucketName:
+    Type: String
+    Default: alphaengine-543466170164-us-east-1-an
+  ServiceRoleName:
+    Type: String
+    Default: AlphaEngineServiceRole
+  MassiveSecretArn:
+    Type: String
+    NoEcho: true
+  TableName:
+    Type: String
+    Default: AlphaEngineIngestion
+  QueueName:
+    Type: String
+    Default: alphaengine-ingestion
+  ScheduledQueueName:
+    Type: String
+    Default: alphaengine-ingestion-scheduled
+  ControlCodeKey:
+    Type: String
+  WorkerCodeKey:
+    Type: String
+
+Resources:
+  IngestionTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Ref TableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+        - AttributeName: gsi1pk
+          AttributeType: S
+        - AttributeName: gsi1sk
+          AttributeType: S
+        - AttributeName: gsi2pk
+          AttributeType: S
+        - AttributeName: gsi2sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: IngestionIndex
+          KeySchema:
+            - AttributeName: gsi1pk
+              KeyType: HASH
+            - AttributeName: gsi1sk
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: IngestionDataIndex
+          KeySchema:
+            - AttributeName: gsi2pk
+              KeyType: HASH
+            - AttributeName: gsi2sk
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  UnitDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+
+  UnitQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Ref QueueName
+      VisibilityTimeout: 360
+      MessageRetentionPeriod: 1209600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt UnitDeadLetterQueue.Arn
+        maxReceiveCount: 5
+
+  ScheduledUnitDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+
+  ScheduledUnitQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Ref ScheduledQueueName
+      VisibilityTimeout: 360
+      MessageRetentionPeriod: 1209600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ScheduledUnitDeadLetterQueue.Arn
+        maxReceiveCount: 5
+
+  IngestionPermissions:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub ${AWS::StackName}-ingestion
+      Roles:
+        - !Ref ServiceRoleName
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Logs
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*
+          - Sid: IngestionTable
+            Effect: Allow
+            Action:
+              - dynamodb:BatchWriteItem
+              - dynamodb:DeleteItem
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+              - dynamodb:Query
+              - dynamodb:TransactWriteItems
+              - dynamodb:UpdateItem
+            Resource:
+              - !GetAtt IngestionTable.Arn
+              - !Sub ${IngestionTable.Arn}/index/IngestionIndex
+              - !Sub ${IngestionTable.Arn}/index/IngestionDataIndex
+          - Sid: IngestionQueue
+            Effect: Allow
+            Action:
+              - sqs:ChangeMessageVisibility
+              - sqs:DeleteMessage
+              - sqs:GetQueueAttributes
+              - sqs:ReceiveMessage
+              - sqs:SendMessage
+            Resource:
+              - !GetAtt UnitQueue.Arn
+              - !GetAtt ScheduledUnitQueue.Arn
+          - Sid: IngestionWorkflow
+            Effect: Allow
+            Action:
+              - states:StartExecution
+            Resource: !GetAtt IngestionStateMachine.Arn
+          - Sid: IngestionObjects
+            Effect: Allow
+            Action:
+              - s3:DeleteObject
+              - s3:GetObject
+              - s3:PutObject
+            Resource: !Sub arn:${AWS::Partition}:s3:::${BucketName}/*
+          - Sid: IngestionBucket
+            Effect: Allow
+            Action:
+              - s3:ListBucket
+            Resource: !Sub arn:${AWS::Partition}:s3:::${BucketName}
+          - Sid: MassiveSecret
+            Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+            Resource: !Ref MassiveSecretArn
+
+  IngestionStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DispatchIngestionUnits
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::${BucketName}/manifests/provider=massive/*
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource:
+                  - !GetAtt UnitQueue.Arn
+                  - !GetAtt ScheduledUnitQueue.Arn
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Sub arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${AWS::StackName}-dispatcher
+              - Effect: Allow
+                Action:
+                  - states:DescribeExecution
+                Resource: !Sub arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:execution:${AWS::StackName}-dispatcher:*
+
+  IngestionStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub ${AWS::StackName}-dispatcher
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt IngestionStateMachineRole.Arn
+      DefinitionString:
+        !Sub
+          - |
+            {
+              "StartAt": "DispatchUnits",
+              "States": {
+                "DispatchUnits": {
+                  "Type": "Map",
+                  "MaxConcurrency": 10,
+                  "ItemReader": {
+                    "Resource": "arn:${AWS::Partition}:states:::s3:getObject",
+                    "ReaderConfig": {"InputType": "JSON"},
+                    "Parameters": {"Bucket": "${ManifestBucket}", "Key.$": "$.manifest_key"}
+                  },
+                  "ItemProcessor": {
+                    "ProcessorConfig": {"Mode": "DISTRIBUTED", "ExecutionType": "STANDARD"},
+                    "StartAt": "SendUnit",
+                    "States": {
+                      "SendUnit": {
+                        "Type": "Task",
+                        "Resource": "arn:${AWS::Partition}:states:::sqs:sendMessage",
+                        "Parameters": {
+                          "QueueUrl.$": "$.queue_url",
+                          "MessageBody.$": "States.JsonToString($)"
+                        },
+                        "Retry": [{"ErrorEquals":["States.ALL"],"IntervalSeconds":5,"BackoffRate":2.0,"MaxAttempts":5}],
+                        "End": true
+                      }
+                    }
+                  },
+                  "End": true
+                }
+              }
+            }
+          - ManifestBucket: !Ref BucketName
+            QueueUrl: !Ref UnitQueue
+
+  ControlFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: IngestionPermissions
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-control
+      Description: AlphaEngine ingestion control boundary.
+      Runtime: provided.al2023
+      Handler: bootstrap
+      Architectures:
+        - arm64
+      MemorySize: 1024
+      Timeout: 900
+      Role: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ServiceRoleName}
+      Code:
+        S3Bucket: !Ref BucketName
+        S3Key: !Ref ControlCodeKey
+      Environment:
+        Variables:
+          BACKTEST_AWS_REGION: !Ref AWS::Region
+          INGESTION_S3_BUCKET: !Ref BucketName
+          INGESTION_TABLE_NAME: !Ref TableName
+          INGESTION_QUEUE_URL: !Ref UnitQueue
+          INGESTION_SCHEDULED_QUEUE_URL: !Ref ScheduledUnitQueue
+          INGESTION_WORKER_FUNCTION: !Ref WorkerFunction
+          INGESTION_STATE_MACHINE_ARN: !GetAtt IngestionStateMachine.Arn
+
+  WorkerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: IngestionPermissions
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-worker
+      Description: AlphaEngine Massive one-unit ingestion worker.
+      Runtime: provided.al2023
+      Handler: bootstrap
+      Architectures:
+        - arm64
+      MemorySize: 1024
+      Timeout: 120
+      ReservedConcurrentExecutions: 1
+      Role: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ServiceRoleName}
+      Code:
+        S3Bucket: !Ref BucketName
+        S3Key: !Ref WorkerCodeKey
+      Environment:
+        Variables:
+          BACKTEST_AWS_REGION: !Ref AWS::Region
+          INGESTION_S3_BUCKET: !Ref BucketName
+          INGESTION_TABLE_NAME: !Ref TableName
+          INGESTION_QUEUE_URL: !Ref UnitQueue
+          MASSIVE_SECRET_ARN: !Ref MassiveSecretArn
+
+  WorkerEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      Enabled: true
+      EventSourceArn: !GetAtt UnitQueue.Arn
+      FunctionName: !Ref WorkerFunction
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+  ScheduledWorkerEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      Enabled: true
+      EventSourceArn: !GetAtt ScheduledUnitQueue.Arn
+      FunctionName: !Ref WorkerFunction
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+  DailyScheduleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-scheduler
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeControl
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt ControlFunction.Arn
+
+  DailySchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Description: Fetch the last seven completed New York calendar dates.
+      FlexibleTimeWindow:
+        Mode: OFF
+      ScheduleExpression: cron(0 6 * * ? *)
+      ScheduleExpressionTimezone: America/New_York
+      State: ENABLED
+      Target:
+        Arn: !GetAtt ControlFunction.Arn
+        RoleArn: !GetAtt DailyScheduleRole.Arn
+        Input: '{"action":"run_scheduled","input":{}}'
+
+Outputs:
+  ControlFunctionArn:
+    Value: !GetAtt ControlFunction.Arn
+  WorkerFunctionArn:
+    Value: !GetAtt WorkerFunction.Arn
+  StateMachineArn:
+    Value: !GetAtt IngestionStateMachine.Arn
+  QueueUrl:
+    Value: !Ref UnitQueue
+  ScheduledQueueUrl:
+    Value: !Ref ScheduledUnitQueue
+  TableName:
+    Value: !Ref IngestionTable
+  ScheduleArn:
+    Value: !GetAtt DailySchedule.Arn
